@@ -26,8 +26,12 @@ Providers that are not installed simply do not get a cell. DeepSeek's cell appea
 There is no local session to borrow, so the key is yours. The app reads it from the first of:
 
 1. `%APPDATA%\codenotch\deepseek.json` — `{ "api_key": "sk-…", "budget": 20.0 }`
-2. the `DEEPSEEK_API_KEY` environment variable
-3. `config.json` — `{ "deepseek_key": "sk-…", "deepseek_budget": 20.0 }`
+2. `DEEPSEEK_API_KEY` in the app's own environment
+3. `DEEPSEEK_API_KEY` in the **user** environment (`HKCU\Environment`) — where `setx` puts it, and
+   the same value the DSH harness resolves for its own balance widget, so a key already set up for
+   DSH needs no second copy here. A process only inherits the environment it was started with, so
+   the registry is read directly rather than trusting `std::env`.
+4. `config.json` — `{ "deepseek_key": "sk-…", "deepseek_budget": 20.0 }`
 
 `budget` is optional and is read in the balance's own currency; leave it out (or 0) to keep the cell on
 the vendor's number. The key is never written by the app, never logged, and a rejected key only turns

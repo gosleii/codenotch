@@ -14,8 +14,11 @@
 //!
 //! The key is read, in order, from:
 //!   1. %APPDATA%\codenotch\deepseek.json   { "api_key": "sk-…", "budget": 20.0 }
-//!   2. the DEEPSEEK_API_KEY environment variable
-//!   3. config.json                         { "deepseek_key": "sk-…", "deepseek_budget": 20.0 }
+//!   2. DEEPSEEK_API_KEY in this process
+//!   3. DEEPSEEK_API_KEY in the user environment (HKCU\\Environment) — where `setx` puts it, and
+//!      the same value the DSH harness resolves, so a key already set up for DSH needs no second
+//!      copy here
+//!   4. config.json                         { "deepseek_key": "sk-…", "deepseek_budget": 20.0 }
 //! The app never writes a key anywhere, and the key is never logged or put in an error message.
 //!
 //! Failure discipline matches the Claude adapter: 401/403 → needsAuth, 429 → exponential backoff
@@ -96,7 +99,50 @@ fn endpoint(s: &Settings) -> String {
     }
 }
 
-/// The settings file first, then the environment, then config.json
+/// The value of a user environment variable, straight out of HKCU\\Environment.
+///
+/// A process only inherits the environment it was started with, so a key added with `setx` after
+/// the shell or this app launched is invisible to `std::env` while sitting right there in the
+/// registry. It is also exactly what DSH resolves for DEEPSEEK_API_KEY, so a machine already set
+/// up for DSH lights this cell without a second copy of the secret.
+#[cfg(windows)]
+fn user_env(name: &str) -> Option<String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{
+        RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
+    };
+    let sub: Vec<u16> = "Environment\0".encode_utf16().collect();
+    let val: Vec<u16> = format!("{name}\0").encode_utf16().collect();
+    let mut buf = [0u16; 1024];
+    let mut len = (buf.len() * 2) as u32;
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            PCWSTR(sub.as_ptr()),
+            PCWSTR(val.as_ptr()),
+            RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ,
+            None,
+            Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
+            Some(&mut len),
+        )
+    };
+    if rc != ERROR_SUCCESS {
+        return None;
+    }
+    // len counts the terminating NUL too, and is in bytes
+    let n = (len as usize / 2).saturating_sub(1).min(buf.len());
+    let s = String::from_utf16_lossy(&buf[..n]).trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
+#[cfg(not(windows))]
+fn user_env(_name: &str) -> Option<String> {
+    None
+}
+
+/// The settings file first, then the environment (this process, then the user registry value),
+/// then config.json
 pub fn settings() -> Settings {
     let mut s = std::fs::read_to_string(settings_path())
         .ok()
@@ -111,6 +157,11 @@ pub fn settings() -> Settings {
     }
     if s.api_key.trim().is_empty() {
         if let Ok(k) = std::env::var("DEEPSEEK_API_KEY") {
+            s.api_key = k;
+        }
+    }
+    if s.api_key.trim().is_empty() {
+        if let Some(k) = user_env("DEEPSEEK_API_KEY") {
             s.api_key = k;
         }
     }
@@ -147,7 +198,7 @@ pub fn probe() -> String {
     let s = settings();
     if s.api_key.is_empty() {
         format!(
-            "DeepSeek: no key. Put {{\"api_key\":\"sk-…\"}} in {} (or set DEEPSEEK_API_KEY)",
+            "DeepSeek: no key. Put {{\"api_key\":\"sk-…\"}} in {}, or set DEEPSEEK_API_KEY (process or user environment — the same value DSH resolves)",
             settings_path().display()
         )
     } else {
