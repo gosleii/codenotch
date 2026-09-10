@@ -96,6 +96,21 @@
     background:rgba(0,0,0,.85);border-radius:8px;padding:4px 8px;display:none
   }
   #notice.show{display:block}
+  /* A readout with no denominator of its own (a prepaid balance): the ring keeps its bare track and
+     the number is printed in place of the percentage, one step down so ¥110.00 still fits. */
+  .pct.txt{font-size:12px;letter-spacing:-.2px}
+
+  /* ===== Left edge =====
+     The same surface, mirrored: the pill hugs the left border with its rounded side on the right and
+     its fillets above/below, and the hover card opens to the right of the pill with its tail on the
+     left. Rust owns the geometry; this only follows the edge it reports. */
+  body.edge-left #pill{right:auto;left:0;border-radius:0 20px 20px 0;border:1px solid #2e2e2e;border-left:none}
+  body.edge-left #pill::before,body.edge-left #pill::after{right:auto;left:0}
+  body.edge-left #pill::before{background:radial-gradient(circle at 100% 0, transparent calc(var(--fillet) - 1.5px), #2e2e2e calc(var(--fillet) - 0.5px), #000 calc(var(--fillet) + 0.5px))}
+  body.edge-left #pill::after{background:radial-gradient(circle at 100% 100%, transparent calc(var(--fillet) - 1.5px), #2e2e2e calc(var(--fillet) - 0.5px), #000 calc(var(--fillet) + 0.5px))}
+  body.edge-left #card{left:80px;right:10px;margin-left:0;margin-right:auto}
+  body.edge-left #card::after{right:auto;left:-8px;border-left:none;border-right:10px solid #0a0a0a}
+  body.edge-left #notice{left:80px;right:8px}
 </style>
 </head>
 <body>
@@ -117,6 +132,8 @@ let usage={status:'',windows:[],fetched_at:0,note:''};
 let codexSnap={status:'absent',windows:[],fetched_at:0,note:''};
 let cursorSnap={status:'absent',windows:[],fetched_at:0,note:''};
 let agSnap={status:'absent',windows:[],fetched_at:0,note:''};
+let dsSnap={status:'absent',windows:[],fetched_at:0,note:''};
+let layout={edge:'right',monitor:'',primary:true}; // which edge Rust pinned the notch to; the page mirrors itself
 let glyphs={}; // id → {kind:'mark'|'appicon', url}
 let activity=[]; // working state of the non-Claude providers: {provider,state:'busy'|'waiting',name,detail,since}
 // "Is it working?" per provider: Claude from the four-state engine, the others from the activity probe. Returns running | attention | idle
@@ -145,11 +162,14 @@ function providers(){
   if(codexSnap.status!=='absent') list.push({id:'codex',name:'Codex',glyph:'Cx',snap:codexSnap});
   if(cursorSnap.status!=='absent') list.push({id:'cursor',name:'Cursor',glyph:'Cu',snap:cursorSnap});
   if(agSnap.status!=='absent') list.push({id:'gemini',name:'Antigravity',glyph:'Ag',snap:agSnap});
+  // DeepSeek has no session behind it, so its cell stays hidden until an API key is configured (status 'absent')
+  if(dsSnap.status!=='absent') list.push({id:'deepseek',name:'DeepSeek',glyph:'Ds',snap:dsSnap});
   return list;
 }
 function headlineOf(snap){
   if(!snap.windows.length) return null;
-  const metered=snap.windows.filter(w=>w.count==null);
+  // Meters only: a pure count or a plain readout (DeepSeek's balance) has no arc to draw
+  const metered=snap.windows.filter(w=>w.count==null&&!w.text);
   if(metered.length) return metered.reduce((a,b)=> b.used>a.used?b:a);
   return snap.windows[0];
 }
@@ -188,14 +208,16 @@ function renderRing(){
     const svg=cell.querySelector('svg.ring'), pct=cell.querySelector('.pct'), glyph=cell.querySelector('.glyph'), wrap=cell.querySelector('.ringwrap');
     const h=headlineOf(p.snap);
     let inner=`<circle cx="28" cy="28" r="22" fill="#2a2a2a"/><circle cx="28" cy="28" r="25" fill="none" stroke="${TRACK}" stroke-width="5"/>`;
-    if(h && h.count==null) inner+=svgArc(25,Math.min(h.used,1),tone(h.used),5);
+    if(h && h.count==null && !h.text) inner+=svgArc(25,Math.min(h.used,1),tone(h.used),5);
     { // thin inner arc: spinning = working, amber pulse = waiting on you (one animation for all four, different sources)
       const ws=workState(p.id);
       if(ws==='running') inner+=`<g class="arc-spin">${svgArc(19,0.28,RUNGREEN,2.5)}</g>`;
       else if(ws==='attention') inner+=`<g class="arc-pulse"><circle cx="28" cy="28" r="19" fill="none" stroke="${AMBER}" stroke-width="2.5"/></g>`;
     }
     svg.innerHTML=inner;
+    pct.classList.toggle('txt', !!(h&&h.text));
     if(p.snap.status==='needsAuth'||p.snap.status==='none') pct.textContent='—';
+    else if(h && h.text) pct.textContent=h.text; // a balance is the reading itself; there is nothing to divide it by
     else if(h && h.count!=null) pct.textContent='~'+h.count;
     else if(h) pct.textContent=(h.derived?'~':'')+Math.round(h.used*100)+'%';
     else pct.textContent='…';
@@ -232,12 +254,17 @@ function renderCard(){
   let html=`<div class="c-head">${headIcon}<span class="c-title">${p.name} Usage</span></div>`;
   if(staleOf(snap)&&snap.fetched_at) html+=`<div class="c-sub">Updated ${ago(snap.fetched_at)}</div>`;
   if(snap.status==='needsAuth'){
-    const who={claude:'Sign in to Claude Code to see usage.',cursor:'Sign in to Cursor to see usage.',codex:'Sign in to Codex to see usage.',gemini:'Sign in to Antigravity to see usage.'}[p.id]||'';
+    const who={claude:'Sign in to Claude Code to see usage.',cursor:'Sign in to Cursor to see usage.',codex:'Sign in to Codex to see usage.',gemini:'Sign in to Antigravity to see usage.',deepseek:'Add a DeepSeek API key to see the balance.'}[p.id]||'';
     html+=`<div class="c-note">${who}<br>${snap.note||''}</div>`;
   }else if(!snap.windows.length){
     html+=`<div class="c-note">${snap.note||'Waiting for first reading…'}</div>`;
   }else{
     for(const w of snap.windows){
+      if(w.text!=null){ // a plain readout: the value, no track and no percentage
+        html+=`<div class="win"><div class="w-row"><span class="w-label">${w.label}</span></div>
+          <div class="w-used" style="font-size:15px;color:#e8e8ea;font-weight:600">${esc(w.text)}</div></div>`;
+        continue;
+      }
       if(w.count!=null){
         html+=`<div class="win"><div class="w-row"><span class="w-label">${w.label}</span></div>
           <div class="w-used">${w.count>0?`~${w.count} request${w.count===1?'':'s'} today`:'no requests today'}</div></div>`;
@@ -401,6 +428,12 @@ listen('activity',e=>{activity=e.payload||activity;renderRing();if(card.classLis
 invoke('get_activity').then(a=>{activity=a||activity;renderRing();}).catch(()=>{});
 invoke('get_glyphs').then(g=>{glyphs=g||glyphs;renderRing();}).catch(()=>{});
 invoke('get_codex').then(u=>{codexSnap=u||codexSnap;renderRing();}).catch(()=>{});
+listen('deepseek',e=>{dsSnap=e.payload||dsSnap;renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
+invoke('get_deepseek').then(u=>{dsSnap=u||dsSnap;renderRing();}).catch(()=>{});
+// Which edge the window is pinned to: the whole surface mirrors for a left-edge notch
+function applyLayout(){document.body.classList.toggle('edge-left', layout.edge==='left');reportHot();}
+listen('layout',e=>{layout=e.payload||layout;applyLayout();}).catch(()=>{});
+invoke('get_layout').then(l=>{layout=l||layout;applyLayout();}).catch(()=>{});
 invoke('get_usage').then(u=>{usage=u||usage;renderRing();}).catch(e=>notice('get_usage failed: '+e));
 invoke('get_state').then(s=>{stateSnap=s||stateSnap;renderRing();}).catch(()=>{});
 setInterval(renderRing,30_000); // stale state and reset copy move with time

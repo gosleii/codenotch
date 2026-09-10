@@ -18,9 +18,27 @@ pub struct Config {
     /// Allow dragging + wheel resizing (tray toggle, off by default to prevent accidental drags)
     #[serde(default)]
     pub drag_enabled: bool,
-    /// Vertical position of the notch: the window centre as a fraction of the primary monitor's height (0 = top, 1 = bottom), default 0.5; saved after a drag
+    /// Vertical position of the notch: the window centre as a fraction of the target monitor's height (0 = top, 1 = bottom), default 0.5; saved after a drag
     #[serde(default = "default_notch_y")]
     pub notch_y: f64,
+    /// Which monitor the notch is pinned to: the monitor's own name (e.g. "\\.\DISPLAY2"), or None for the primary
+    #[serde(default)]
+    pub monitor: Option<String>,
+    /// Which screen edge it hugs: "right" | "left" (the pill mirrors, the hover card opens the other way)
+    #[serde(default = "default_edge")]
+    pub edge: String,
+    /// DeepSeek API key (Bearer). Empty = the DeepSeek cell stays hidden. Kept out of the way in
+    /// deepseek.json / DEEPSEEK_API_KEY is preferred; this field is the last resort.
+    #[serde(default)]
+    pub deepseek_key: String,
+    /// Declared prepaid DeepSeek budget in the balance's own currency; > 0 turns the ring into a
+    /// derived "budget used" percentage. 0 keeps the cell on the vendor's balance number.
+    #[serde(default)]
+    pub deepseek_budget: f64,
+}
+
+fn default_edge() -> String {
+    "right".into()
 }
 
 fn default_notch_y() -> f64 {
@@ -44,6 +62,10 @@ impl Default for Config {
             bar_w: None,
             drag_enabled: false,
             notch_y: default_notch_y(),
+            monitor: None,
+            edge: default_edge(),
+            deepseek_key: String::new(),
+            deepseek_budget: 0.0,
         }
     }
 }

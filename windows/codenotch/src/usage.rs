@@ -58,6 +58,19 @@ pub struct LimitWindow {
     /// The number is ours, not the vendor's (upstream fidelity=.derived) — the card adds a ~ prefix
     #[serde(default)]
     pub derived: bool,
+    /// A plain readout with no denominator of its own (DeepSeek's prepaid balance, say): the cell
+    /// shows this text instead of a percentage and the ring draws only its track, exactly as a
+    /// pure-count window does.
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+impl LimitWindow {
+    /// Nothing to draw an arc from: a vendor count or a plain readout (DeepSeek's balance) is the
+    /// whole reading, so the ring keeps its bare track and the cell prints the value instead.
+    pub fn only_a_readout(&self) -> bool {
+        self.count.is_some() || self.text.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

@@ -32,7 +32,7 @@ const ANTIGRAVITY_STALE_MS: u64 = 45_000;
 
 #[derive(Clone, Serialize, Debug, PartialEq)]
 pub struct Activity {
-    /// Provider id other than claude: codex / cursor / gemini
+    /// Provider id other than claude: codex / cursor / gemini / deepseek
     pub provider: String,
     /// busy | waiting
     pub state: String,
@@ -514,6 +514,75 @@ fn antigravity_activity() -> Vec<Activity> {
     vec![Activity { provider: "gemini".into(), state: "busy".into(), name: "Antigravity".into(), detail: "Working".into(), since: at }]
 }
 
+// ---------------- DeepSeek ----------------
+
+/// The DeepSeek cell has no local CLI behind it, but the DSH harness on this machine is a DeepSeek
+/// client, and it leaves a session transcript behind while it works. That is the same class of
+/// evidence as Antigravity's transcripts: an inference from recent writes, never claimed as a
+/// reading from DeepSeek itself. The row in the card names the writer, so nobody has to guess.
+///
+/// Staleness is generous on purpose: a turn spends most of its wall time streaming one response,
+/// and a long tool call can leave the transcript untouched for a minute without the agent being
+/// idle. 90 s says "working" through that and still drops the arc soon after a turn ends.
+const DSH_STALE_MS: u64 = 90_000;
+
+/// A transcript file worth timing: "slug · when" is all the cell needs to name the session, and
+/// nothing here is ever uploaded anywhere.
+fn transcript_candidate(p: &std::path::Path) -> Option<(String, u64)> {
+    let name = p.file_name()?.to_string_lossy().to_string();
+    if !(name.ends_with(".jsonl") || name.ends_with(".jsonl.zstd")) {
+        return None;
+    }
+    let at = mtime_ms(p)?;
+    // sessions/<slug>/<session id>/session.jsonl[.zstd] — the slug is the readable one
+    let label = p
+        .parent()
+        .and_then(|d| d.parent())
+        .and_then(|d| d.file_name())
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| name.clone());
+    Some((label, at))
+}
+
+/// Walks the transcript tree and returns the most recently written file's label and mtime.
+fn newest_transcript(dir: &std::path::Path, depth: usize) -> Option<(String, u64)> {
+    if depth > 4 {
+        return None;
+    }
+    let rd = std::fs::read_dir(dir).ok()?;
+    let mut best: Option<(String, u64)> = None;
+    for e in rd.flatten() {
+        let p = e.path();
+        let found = if p.is_dir() { newest_transcript(&p, depth + 1) } else { transcript_candidate(&p) };
+        if let Some((label, at)) = found {
+            if best.as_ref().map(|(_, n)| at > *n).unwrap_or(true) {
+                best = Some((label, at));
+            }
+        }
+    }
+    best
+}
+
+fn dsh_activity() -> Vec<Activity> {
+    let Some(root) = dirs::home_dir().map(|h| h.join(".dsh").join("sessions")) else { return vec![] };
+    if !root.is_dir() {
+        return vec![];
+    }
+    let Some((label, at)) = newest_transcript(&root, 0) else { return vec![] };
+    if now_ms().saturating_sub(at) > DSH_STALE_MS {
+        return vec![];
+    }
+    let label = label.trim_matches('-').replace('-', "/");
+    let label = if label.is_empty() { "session".to_string() } else { label };
+    vec![Activity {
+        provider: "deepseek".into(),
+        state: "busy".into(),
+        name: format!("DSH · {label}"),
+        detail: "Working".into(),
+        since: at,
+    }]
+}
+
 // ---------------- Putting it together ----------------
 
 #[derive(Clone, Copy, Default)]
@@ -539,6 +608,9 @@ fn read_all(p: Presence, ctx: &mut Ctx) -> Vec<Activity> {
     if p.gemini {
         all.extend(antigravity_activity());
     }
+    // Not gated on presence: the harness is found by its transcripts alone, and an absent one is an
+    // empty list rather than an error
+    all.extend(dsh_activity());
     all
 }
 

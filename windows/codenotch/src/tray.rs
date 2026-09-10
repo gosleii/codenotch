@@ -45,6 +45,39 @@ pub fn build_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
         .build()?;
     let refresh = MenuItemBuilder::with_id("refresh", tr(lang, "refresh")).build(app)?;
     let reset = MenuItemBuilder::with_id("reset", tr(lang, "reset_pos")).build(app)?;
+    // Screen: one check item per attached monitor, plus "Primary" for the default. The id carries
+    // the monitor's own name, which is what the config stores and what place_notch looks up.
+    let current_monitor = {
+        let st = app.state::<crate::AppState>();
+        let c = st.cfg.lock().unwrap();
+        c.monitor.clone()
+    };
+    let primary_item = CheckMenuItemBuilder::with_id("mon-", tr(lang, "monitor_primary"))
+        .checked(current_monitor.is_none())
+        .build(app)?;
+    let mut screen_menu = SubmenuBuilder::new(app, tr(lang, "screen")).item(&primary_item);
+    for (name, is_primary) in crate::monitor_list(app) {
+        let label = if is_primary { format!("{name} · {}", tr(lang, "monitor_primary_tag")) } else { name.clone() };
+        let item = CheckMenuItemBuilder::with_id(format!("mon-{name}"), label)
+            .checked(current_monitor.as_deref() == Some(name.as_str()))
+            .build(app)?;
+        screen_menu = screen_menu.item(&item);
+    }
+    let screen_menu = screen_menu.build()?;
+    let current_edge = {
+        let st = app.state::<crate::AppState>();
+        let c = st.cfg.lock().unwrap();
+        c.edge.clone()
+    };
+    let e_right = CheckMenuItemBuilder::with_id("edge-right", tr(lang, "edge_right"))
+        .checked(current_edge != "left")
+        .build(app)?;
+    let e_left = CheckMenuItemBuilder::with_id("edge-left", tr(lang, "edge_left"))
+        .checked(current_edge == "left")
+        .build(app)?;
+    let edge_menu = SubmenuBuilder::new(app, tr(lang, "edge"))
+        .items(&[&e_right, &e_left])
+        .build()?;
     let open_data = MenuItemBuilder::with_id("open-data", tr(lang, "open_data")).build(app)?;
     let auto = CheckMenuItemBuilder::with_id("autostart", tr(lang, "autostart"))
         .checked(crate::autostart::is_enabled())
@@ -55,6 +88,8 @@ pub fn build_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
         .separator()
         .item(&lang_menu)
         .item(&refresh)
+        .item(&screen_menu)
+        .item(&edge_menu)
         .item(&reset)
         .item(&open_data)
         .item(&auto)
@@ -103,6 +138,7 @@ fn handle(app: &AppHandle, id: &str) {
             crate::codex::request_refresh();
             crate::cursor::request_refresh();
             crate::antigravity::request_refresh();
+            crate::deepseek::request_refresh();
             let a = app.clone();
             std::thread::spawn(move || crate::reload_glyphs(&a));
         }
@@ -117,6 +153,27 @@ fn handle(app: &AppHandle, id: &str) {
         }
         "quit" => app.exit(0),
         _ if id.starts_with("lang-") => crate::apply_lang(app, &id[5..]),
+        // "mon-" with an empty remainder is the primary monitor; otherwise the name follows verbatim
+        _ if id.starts_with("mon-") => {
+            {
+                let st = app.state::<crate::AppState>();
+                let mut c = st.cfg.lock().unwrap();
+                c.monitor = Some(id[4..].to_string()).filter(|n| !n.is_empty());
+                crate::config::save(&c);
+            }
+            crate::place_notch(app);
+            refresh_menu(app);
+        }
+        _ if id.starts_with("edge-") => {
+            {
+                let st = app.state::<crate::AppState>();
+                let mut c = st.cfg.lock().unwrap();
+                c.edge = id[5..].to_string();
+                crate::config::save(&c);
+            }
+            crate::place_notch(app);
+            refresh_menu(app);
+        }
         _ => {}
     }
 }

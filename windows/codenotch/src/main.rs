@@ -10,6 +10,7 @@ mod server;
 mod state;
 mod tray;
 mod usage;
+mod deepseek;
 mod codex;
 mod cursor;
 mod antigravity;
@@ -35,6 +36,8 @@ pub struct AppState {
     pub codex: Mutex<usage::UsageSnapshot>,
     pub cursor: Mutex<usage::UsageSnapshot>,
     pub antigravity: Mutex<usage::UsageSnapshot>,
+    /// DeepSeek API snapshot (balance; "absent" while no key is configured)
+    pub deepseek: Mutex<usage::UsageSnapshot>,
     /// Provider glyph cache, collected at launch and again on a tray refresh
     pub glyphs: Mutex<std::collections::HashMap<String, glyphs::Glyph>>,
     /// Working state of the non-Claude providers (Cursor reports it; Codex and Antigravity are inferred from recent writes)
@@ -59,13 +62,34 @@ pub fn broadcast(app: &AppHandle) {
     let _ = app.emit("state", &snap);
 }
 
-/// Pins the notch to the right edge of the primary monitor; the other edges are a later milestone.
+/// The monitor the notch is pinned to: the one named in the config, else the primary. A monitor
+/// named in the config but no longer attached (undocked laptop, unplugged display) falls back
+/// silently, so a stale config can never park the notch off-screen.
+pub fn notch_monitor(app: &AppHandle) -> Option<tauri::Monitor> {
+    let w = app.get_webview_window("notch")?;
+    let want = {
+        let st = app.state::<AppState>();
+        let c = st.cfg.lock().unwrap();
+        c.monitor.clone()
+    };
+    if let Some(name) = want {
+        if let Ok(mons) = w.available_monitors() {
+            if let Some(m) = mons.into_iter().find(|m| m.name().map(|n| *n == name).unwrap_or(false)) {
+                return Some(m);
+            }
+        }
+    }
+    w.primary_monitor().ok().flatten()
+}
+
+/// Pins the notch to the configured edge of the configured monitor (default: right edge of the
+/// primary one). The page is told which edge it is on so it can mirror itself.
 pub fn place_notch(app: &AppHandle) {
     let Some(w) = app.get_webview_window("notch") else {
         return;
     };
     let scale = w.scale_factor().unwrap_or(1.0);
-    if let Ok(Some(mon)) = w.primary_monitor() {
+    if let Some(mon) = notch_monitor(app) {
         // Two monitors at different scales (150 % and 200 % in practice): the physical size can
         // end up converted with the *other* monitor's scale factor depending on where the window
         // is created and then moved, leaving the WebView ~256 logical px wide instead of 340.
@@ -80,28 +104,43 @@ pub fn place_notch(app: &AppHandle) {
             .outer_size()
             .map(|s| (s.width as i32, s.height as i32))
             .unwrap_or(((NOTCH_W * scale) as i32, (NOTCH_H * scale) as i32));
-        let x = mon.position().x + mon.size().width as i32 - ww;
         // Vertical position comes from the configured ratio (the pill can be dragged; it persists), clamped to the monitor
-        let ratio = {
+        let (edge, ratio) = {
             let st = app.state::<AppState>();
             let c = st.cfg.lock().unwrap();
-            c.notch_y.clamp(0.0, 1.0)
+            (c.edge.clone(), c.notch_y.clamp(0.0, 1.0))
         };
+        let left_edge = edge == "left";
+        // Left edge = the monitor's own left border (the far edge of a display arranged to the left);
+        // right edge = its right border.
+        let edge_x = |width: i32| {
+            if left_edge {
+                mon.position().x
+            } else {
+                mon.position().x + mon.size().width as i32 - width
+            }
+        };
+        let x = edge_x(ww);
         let mh = mon.size().height as i32;
         let y = (mon.position().y as f64 + mh as f64 * ratio - wh as f64 / 2.0).round() as i32;
         let y = y.clamp(mon.position().y, mon.position().y + (mh - wh).max(0));
         let _ = w.set_position(tauri::PhysicalPosition::new(x, y));
+        let mut x = x;
         if w.outer_size().map(|s| s.width != target.width).unwrap_or(false) {
             let _ = w.set_size(target);
-            let x = mon.position().x + mon.size().width as i32 - target.width as i32;
+            x = edge_x(target.width as i32);
             let _ = w.set_position(tauri::PhysicalPosition::new(x, y));
         }
+        let name = mon.name().cloned().unwrap_or_default();
+        // Tell the page which way round it is: the pill's rounded side, its fillets and the side the
+        // hover card opens on all depend on it
+        let _ = app.emit("layout", current_layout(app));
         // Placement log line: the first thing to check when the notch is not visible
         let log = config::config_path().with_file_name("run.log");
         let _ = std::fs::write(
             log,
             format!(
-                "notch placed build={BUILD}: pos=({x},{y}) size=({ww}x{wh}) inner={:?} win_scale={scale} mon_scale={ms} monitor=({},{} {}x{})\n",
+                "notch placed build={BUILD}: edge={edge} monitor={name} pos=({x},{y}) size=({ww}x{wh}) inner={:?} win_scale={scale} mon_scale={ms} monitor_rect=({},{} {}x{})\n",
                 w.inner_size().map(|s| (s.width, s.height)).unwrap_or((0, 0)),
                 mon.position().x,
                 mon.position().y,
@@ -149,8 +188,8 @@ fn drag_begin(app: AppHandle) {
             DRAGGING.store(false, std::sync::atomic::Ordering::SeqCst);
             return;
         };
-        let (Ok(start_cur), Ok(start_pos), Ok(size), Ok(Some(mon))) =
-            (app.cursor_position(), w.outer_position(), w.outer_size(), w.primary_monitor())
+        let (Ok(start_cur), Ok(start_pos), Ok(size), Some(mon)) =
+            (app.cursor_position(), w.outer_position(), w.outer_size(), notch_monitor(&app))
         else {
             DRAGGING.store(false, std::sync::atomic::Ordering::SeqCst);
             return;
@@ -260,11 +299,72 @@ fn refresh_usage(app: AppHandle) {
     codex::request_refresh();
     cursor::request_refresh();
     antigravity::request_refresh();
+    deepseek::request_refresh();
 }
 
 #[tauri::command]
 fn get_antigravity(state: tauri::State<AppState>) -> usage::UsageSnapshot {
     state.antigravity.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn get_deepseek(state: tauri::State<AppState>) -> usage::UsageSnapshot {
+    state.deepseek.lock().unwrap().clone()
+}
+
+/// Where the notch currently sits: the page mirrors itself for a left-edge notch (the card opens
+/// to the right there, and the pill's rounded side and fillets swap over).
+#[derive(Clone, serde::Serialize)]
+pub struct Layout {
+    pub edge: String,
+    pub monitor: String,
+    pub primary: bool,
+}
+
+pub fn current_layout(app: &AppHandle) -> Layout {
+    let (edge, want) = {
+        let st = app.state::<AppState>();
+        let c = st.cfg.lock().unwrap();
+        (c.edge.clone(), c.monitor.clone())
+    };
+    Layout {
+        edge,
+        monitor: want.clone().unwrap_or_default(),
+        primary: want.is_none(),
+    }
+}
+
+#[tauri::command]
+fn get_layout(app: AppHandle) -> Layout {
+    current_layout(&app)
+}
+
+/// Every monitor the notch can be pinned to, as (name, primary) — the tray builds its Screen menu
+/// from this and the page only ever needs the name it was told about.
+pub fn monitor_list(app: &AppHandle) -> Vec<(String, bool)> {
+    let Some(w) = app.get_webview_window("notch") else { return Vec::new() };
+    let primary = w
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .and_then(|m| m.name().cloned())
+        .unwrap_or_default();
+    w.available_monitors()
+        .map(|mons| {
+            mons.into_iter()
+                .filter_map(|m| m.name().cloned())
+                .map(|n| {
+                    let is_primary = n == primary;
+                    (n, is_primary)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+fn get_monitors(app: AppHandle) -> Vec<(String, bool)> {
+    monitor_list(&app)
 }
 
 #[tauri::command]
@@ -316,6 +416,7 @@ fn open_provider_page(provider: String) {
         "codex" => "https://chatgpt.com/#settings/Account",
         "cursor" => "https://cursor.com/dashboard",
         "gemini" => "https://antigravity.google",
+        "deepseek" => "https://platform.deepseek.com/usage",
         _ => "https://claude.ai/settings/usage",
     };
     let mut cmd = std::process::Command::new("cmd");
@@ -376,10 +477,7 @@ pub fn applog(line: &str) {
 #[tauri::command]
 fn report_dpr(app: AppHandle, dpr: f64, w: f64, h: f64) {
     let Some(win) = app.get_webview_window("notch") else { return };
-    let want = win
-        .primary_monitor()
-        .ok()
-        .flatten()
+    let want = notch_monitor(&app)
         .map(|m| m.scale_factor())
         .unwrap_or_else(|| win.scale_factor().unwrap_or(1.0));
     let mut z = ZOOM.lock().unwrap();
@@ -663,6 +761,7 @@ fn main() {
             codex: Mutex::new(codex::load_persisted()),
             cursor: Mutex::new(cursor::load_persisted()),
             antigravity: Mutex::new(antigravity::load_persisted()),
+            deepseek: Mutex::new(deepseek::load_persisted()),
             glyphs: Mutex::new(Default::default()),
             activity: Mutex::new(Vec::new()),
         })
@@ -672,6 +771,9 @@ fn main() {
             get_codex,
             get_cursor,
             get_antigravity,
+            get_deepseek,
+            get_layout,
+            get_monitors,
             get_glyphs,
             get_activity,
             open_data_dir,
@@ -700,6 +802,7 @@ fn main() {
             codex::start(handle.clone());
             cursor::start(handle.clone());
             antigravity::start(handle.clone());
+            deepseek::start(handle.clone());
             activity::start(handle.clone());
             // Collecting glyphs may read icon resources out of a few executables; do it off the main thread and push when done
             let gh = handle.clone();
