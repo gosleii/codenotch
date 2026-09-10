@@ -733,6 +733,11 @@ fn main() {
                 report(r);
                 return;
             }
+            // One live balance round trip, without the GUI: useful before the key is installed
+            "deepseek" => {
+                println!("{}", deepseek::check_live(args.get(2).map(|s| s.as_str()).unwrap_or("")));
+                return;
+            }
             "doctor" => {
                 let out = if args.get(2).map(|s| s.as_str()) == Some("deep") { diag::run() } else { doctor::run() };
                 println!("{out}");

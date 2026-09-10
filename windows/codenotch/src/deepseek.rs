@@ -160,6 +160,46 @@ pub fn probe() -> String {
     }
 }
 
+/// `codenotch.exe deepseek [key]` — one live round trip, printed. The optional argument lets the
+/// check run before the key is installed in deepseek.json; the key itself is never echoed back, and
+/// neither the reading nor the key is written to any file by this path.
+pub fn check_live(key_arg: &str) -> String {
+    let mut s = settings();
+    if !key_arg.trim().is_empty() {
+        s.api_key = key_arg.trim().to_string();
+    }
+    let ep = endpoint(&s);
+    if s.api_key.is_empty() {
+        return format!(
+            "DeepSeek: no key\n  endpoint: {ep}\n  put {{\"api_key\":\"sk-…\"}} in {}",
+            settings_path().display()
+        );
+    }
+    match fetch_once(&s.api_key) {
+        Ok(r) => {
+            let mut o = format!("DeepSeek: ok\n  endpoint: {ep}\n");
+            for w in &r.windows {
+                o += &match &w.text {
+                    Some(t) => format!("  {}: {t}\n", w.label),
+                    None => format!("  {}: ~{:.0}% used\n", w.label, w.used * 100.0),
+                };
+            }
+            if !r.note.is_empty() {
+                o += &format!("  {}\n", r.note);
+            }
+            o
+        }
+        // Deliberately says only what was observed: DeepSeek answers 401 for an unknown path too,
+        // so a rejection proves the host is reachable and the key is not accepted — nothing about
+        // the path. The path comes from the published API (api-docs.deepseek.com/api/get-user-balance).
+        Err(FetchErr::NeedsAuth) => format!(
+            "DeepSeek: {ep} answered 401/403 — the host is reachable, the key was not accepted.\n  (A balance is only returned for a valid key; the path follows the published API.)"
+        ),
+        Err(FetchErr::RateLimited(_)) => format!("DeepSeek: rate limited by {ep} — try again in a minute."),
+        Err(FetchErr::Other(m)) => format!("DeepSeek: failed against {ep}\n  {m}"),
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Reading {
     pub windows: Vec<LimitWindow>,
@@ -397,7 +437,8 @@ pub fn start(app: AppHandle) {
 mod tests {
     use super::*;
 
-    /// A recorded reply, verbatim: this is the test that fails first if the endpoint changes shape
+    /// The reply shape published at api-docs.deepseek.com/api/get-user-balance, with the example
+    /// values from the same page verbatim — this is the test that fails first if the endpoint moves.
     const PINNED: &str = r#"{"is_available":true,"balance_infos":[{"currency":"CNY","total_balance":"110.00","granted_balance":"10.00","topped_up_balance":"100.00"}]}"#;
 
     fn value() -> serde_json::Value {

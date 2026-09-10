@@ -33,6 +33,18 @@ There is no local session to borrow, so the key is yours. The app reads it from 
 the vendor's number. The key is never written by the app, never logged, and a rejected key only turns
 the ring into a dash. No key → no cell.
 
+To check a key without waiting for the notch, ask the app directly:
+
+```powershell
+.\target\release\codenotch.exe deepseek              # what is configured, and where the key is read from
+.\target\release\codenotch.exe deepseek sk-…         # one live round trip, printed
+```
+
+The response shape is pinned by `deepseek.rs`'s tests against the example published at
+[api-docs.deepseek.com/api/get-user-balance](https://api-docs.deepseek.com/api/get-user-balance).
+A 401 means the host is reachable and the key was not accepted; DeepSeek answers 401 for an unknown
+path as well, so it says nothing about the path either way.
+
 ## Where it sits
 
 The notch is pinned to the **right edge of the primary monitor** by default. The tray's **Screen** and
