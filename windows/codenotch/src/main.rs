@@ -312,6 +312,23 @@ fn get_deepseek(state: tauri::State<AppState>) -> usage::UsageSnapshot {
     state.deepseek.lock().unwrap().clone()
 }
 
+/// Provider ids the user switched off in the tray
+#[tauri::command]
+fn get_hidden(state: tauri::State<AppState>) -> Vec<String> {
+    state.cfg.lock().unwrap().hidden.clone()
+}
+
+/// A tray toggle changes which cells exist, not where the window is: the page is told directly
+/// rather than re-placed
+pub fn broadcast_providers(app: &AppHandle) {
+    let hidden = {
+        let st = app.state::<AppState>();
+        let c = st.cfg.lock().unwrap();
+        c.hidden.clone()
+    };
+    let _ = app.emit("providers", &hidden);
+}
+
 /// Where the notch currently sits: the page mirrors itself for a left-edge notch (the card opens
 /// to the right there, and the pill's rounded side and fillets swap over).
 #[derive(Clone, serde::Serialize)]
@@ -777,6 +794,7 @@ fn main() {
             get_cursor,
             get_antigravity,
             get_deepseek,
+            get_hidden,
             get_layout,
             get_monitors,
             get_glyphs,

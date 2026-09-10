@@ -35,6 +35,31 @@ pub struct Config {
     /// derived "budget used" percentage. 0 keeps the cell on the vendor's balance number.
     #[serde(default)]
     pub deepseek_budget: f64,
+    /// Provider ids the user switched off ("claude", "codex", "cursor", "gemini", "deepseek").
+    /// A hidden provider draws no cell, stops polling, and stops being probed for activity — the
+    /// point of hiding Cursor is not to keep opening its SQLite every few seconds.
+    #[serde(default)]
+    pub hidden: Vec<String>,
+}
+
+/// Ids the page and the tray agree on, in the order the pill draws them
+pub const PROVIDERS: [(&str, &str); 5] = [
+    ("claude", "Claude"),
+    ("codex", "Codex"),
+    ("cursor", "Cursor"),
+    ("gemini", "Antigravity"),
+    ("deepseek", "DeepSeek"),
+];
+
+/// Is this provider switched off? Read from disk, so a toggle takes effect without a restart
+/// (the tray writes the config; the polling loops ask this once per tick).
+#[cfg(test)]
+pub fn hidden_in(cfg: &Config, id: &str) -> bool {
+    cfg.hidden.iter().any(|h| h == id)
+}
+
+pub fn is_hidden(id: &str) -> bool {
+    load().hidden.iter().any(|h| h == id)
 }
 
 fn default_edge() -> String {
@@ -66,6 +91,7 @@ impl Default for Config {
             edge: default_edge(),
             deepseek_key: String::new(),
             deepseek_budget: 0.0,
+            hidden: Vec::new(),
         }
     }
 }
@@ -92,5 +118,31 @@ pub fn save(cfg: &Config) {
     }
     if let Ok(txt) = serde_json::to_string_pretty(cfg) {
         let _ = std::fs::write(path, txt);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_hidden_provider_is_matched_by_id() {
+        let cfg = Config { hidden: vec!["cursor".into(), "gemini".into()], ..Default::default() };
+        assert!(hidden_in(&cfg, "cursor"));
+        assert!(hidden_in(&cfg, "gemini"));
+        assert!(!hidden_in(&cfg, "claude"));
+    }
+
+    #[test]
+    fn an_older_config_without_the_field_hides_nothing() {
+        let cfg: Config = serde_json::from_str(r#"{"port":48666,"lang":"auto"}"#).unwrap();
+        assert!(cfg.hidden.is_empty());
+        assert!(!hidden_in(&cfg, "cursor"));
+    }
+
+    #[test]
+    fn the_provider_table_matches_the_page_ids() {
+        let ids: Vec<&str> = PROVIDERS.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec!["claude", "codex", "cursor", "gemini", "deepseek"]);
     }
 }

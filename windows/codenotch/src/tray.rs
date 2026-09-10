@@ -78,6 +78,21 @@ pub fn build_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
     let edge_menu = SubmenuBuilder::new(app, tr(lang, "edge"))
         .items(&[&e_right, &e_left])
         .build()?;
+    // Providers: a check item means "shown". Unchecking one removes its cell and stops its polling
+    // and its activity probe, so a provider you do not use costs nothing while it is off.
+    let hidden = {
+        let st = app.state::<crate::AppState>();
+        let c = st.cfg.lock().unwrap();
+        c.hidden.clone()
+    };
+    let mut providers_menu = SubmenuBuilder::new(app, tr(lang, "providers"));
+    for (id, label) in crate::config::PROVIDERS {
+        let item = CheckMenuItemBuilder::with_id(format!("prov-{id}"), label)
+            .checked(!hidden.iter().any(|h| h == id))
+            .build(app)?;
+        providers_menu = providers_menu.item(&item);
+    }
+    let providers_menu = providers_menu.build()?;
     let open_data = MenuItemBuilder::with_id("open-data", tr(lang, "open_data")).build(app)?;
     let auto = CheckMenuItemBuilder::with_id("autostart", tr(lang, "autostart"))
         .checked(crate::autostart::is_enabled())
@@ -88,6 +103,7 @@ pub fn build_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
         .separator()
         .item(&lang_menu)
         .item(&refresh)
+        .item(&providers_menu)
         .item(&screen_menu)
         .item(&edge_menu)
         .item(&reset)
@@ -162,6 +178,22 @@ fn handle(app: &AppHandle, id: &str) {
                 crate::config::save(&c);
             }
             crate::place_notch(app);
+            refresh_menu(app);
+        }
+        _ if id.starts_with("prov-") => {
+            let pid = id[5..].to_string();
+            {
+                let st = app.state::<crate::AppState>();
+                let mut c = st.cfg.lock().unwrap();
+                match c.hidden.iter().position(|h| *h == pid) {
+                    Some(pos) => {
+                        c.hidden.remove(pos);
+                    }
+                    None => c.hidden.push(pid),
+                }
+                crate::config::save(&c);
+            }
+            crate::broadcast_providers(app);
             refresh_menu(app);
         }
         _ if id.starts_with("edge-") => {

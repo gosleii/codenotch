@@ -89,6 +89,10 @@ pub fn tr(lang: &str, key: &str) -> &'static str {
         (_, "edge_left") => "Left edge",
         (_, "monitor_primary") => "Primary monitor",
         (_, "monitor_primary_tag") => "primary",
+        ("zh", "providers") => "提供商",
+        ("ja", "providers") => "プロバイダー",
+        ("ko", "providers") => "공급자",
+        (_, "providers") => "Providers",
         _ => "?",
     }
 }

@@ -593,7 +593,15 @@ pub struct Presence {
 }
 
 fn presence() -> Presence {
-    Presence { cursor: crate::cursor::present(), codex: crate::codex::present(), gemini: crate::antigravity::present() }
+    // A provider switched off in the tray is not probed either: its cell is gone, so a probe would
+    // only cost (Cursor's reads a multi-gigabyte SQLite database, Antigravity's the local bridge).
+    let hidden = crate::config::load().hidden;
+    let off = |id: &str| hidden.iter().any(|h| h == id);
+    Presence {
+        cursor: !off("cursor") && crate::cursor::present(),
+        codex: !off("codex") && crate::codex::present(),
+        gemini: !off("gemini") && crate::antigravity::present(),
+    }
 }
 
 fn read_all(p: Presence, ctx: &mut Ctx) -> Vec<Activity> {

@@ -497,6 +497,16 @@ pub fn start(app: AppHandle) {
             }
         }
         loop {
+            // Switched off in the tray: the cell is gone, so its polling is too
+            if crate::config::is_hidden("codex") {
+                for _ in 0..POLL_SECS {
+                    if REFRESH.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+                continue;
+            }
             let snap = read_once();
             let hold = snap.backoff_until.saturating_sub(now_ms()) / 1000;
             broadcast(&app, snap);

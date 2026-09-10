@@ -134,6 +134,7 @@ let cursorSnap={status:'absent',windows:[],fetched_at:0,note:''};
 let agSnap={status:'absent',windows:[],fetched_at:0,note:''};
 let dsSnap={status:'absent',windows:[],fetched_at:0,note:''};
 let layout={edge:'right',monitor:'',primary:true}; // which edge Rust pinned the notch to; the page mirrors itself
+let hidden=[]; // provider ids switched off in the tray: no cell, and Rust stops polling them too
 let glyphs={}; // id → {kind:'mark'|'appicon', url}
 let activity=[]; // working state of the non-Claude providers: {provider,state:'busy'|'waiting',name,detail,since}
 // "Is it working?" per provider: Claude from the four-state engine, the others from the activity probe. Returns running | attention | idle
@@ -164,7 +165,7 @@ function providers(){
   if(agSnap.status!=='absent') list.push({id:'gemini',name:'Antigravity',glyph:'Ag',snap:agSnap});
   // DeepSeek has no session behind it, so its cell stays hidden until an API key is configured (status 'absent')
   if(dsSnap.status!=='absent') list.push({id:'deepseek',name:'DeepSeek',glyph:'Ds',snap:dsSnap});
-  return list;
+  return list.filter(p=>!hidden.includes(p.id));
 }
 function headlineOf(snap){
   if(!snap.windows.length) return null;
@@ -248,6 +249,7 @@ const STATE_DOT={running:RUNGREEN,attention:AMBER,done:'#57c7ff'};
 let hoverId='claude';
 function renderCard(){
   const c=document.getElementById('card');
+  if(!providers().length){ c.innerHTML=''; c.classList.remove('show'); return; } // every provider switched off
   const p=providers().find(x=>x.id===hoverId)||providers()[0];
   const snap=p.snap;
   const headIcon=glyphHtml(p,true);
@@ -434,6 +436,10 @@ invoke('get_deepseek').then(u=>{dsSnap=u||dsSnap;renderRing();}).catch(()=>{});
 function applyLayout(){document.body.classList.toggle('edge-left', layout.edge==='left');reportHot();}
 listen('layout',e=>{layout=e.payload||layout;applyLayout();}).catch(()=>{});
 invoke('get_layout').then(l=>{layout=l||layout;applyLayout();}).catch(()=>{});
+// Which providers are switched off in the tray: they draw no cell at all
+function applyProviders(){hoverId=providers().some(p=>p.id===hoverId)?hoverId:(providers()[0]||{}).id||'';renderRing();if(card.classList.contains('show'))renderCard();}
+listen('providers',e=>{hidden=e.payload||hidden;applyProviders();}).catch(()=>{});
+invoke('get_hidden').then(h=>{hidden=h||hidden;applyProviders();}).catch(()=>{});
 invoke('get_usage').then(u=>{usage=u||usage;renderRing();}).catch(e=>notice('get_usage failed: '+e));
 invoke('get_state').then(s=>{stateSnap=s||stateSnap;renderRing();}).catch(()=>{});
 setInterval(renderRing,30_000); // stale state and reset copy move with time

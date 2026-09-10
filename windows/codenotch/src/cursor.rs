@@ -288,6 +288,12 @@ pub fn start(app: AppHandle) {
             }
         }
         loop {
+            // Switched off in the tray: no cell, and no work either — the point of hiding Cursor is
+            // not to keep opening its multi-gigabyte SQLite database every few minutes.
+            if crate::config::is_hidden("cursor") {
+                sleep_interruptible(POLL_SECS);
+                continue;
+            }
             let prev = {
                 let st = app.state::<AppState>();
                 let s = st.cursor.lock().unwrap().clone();
