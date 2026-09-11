@@ -151,6 +151,38 @@ pub fn place_notch(app: &AppHandle) {
     }
 }
 
+/// A configured monitor can enumerate a moment after the app starts — at sign-in the display is
+/// still waking up, and a dock or a KVM can take seconds to report itself. `place_notch` falls back
+/// to the primary in that case, which is how "it came up on the wrong screen" happens: the setting
+/// is right, the display simply was not there yet. So when the target is missing at startup, keep
+/// looking for a while and re-place the moment it turns up.
+fn watch_for_target_monitor(app: AppHandle) {
+    let name = {
+        let st = app.state::<AppState>();
+        let c = st.cfg.lock().unwrap();
+        c.monitor.clone()
+    };
+    let Some(name) = name else { return }; // no name configured means the primary, which is always there
+    if monitor_list(&app).iter().any(|(n, _)| *n == name) {
+        return;
+    }
+    applog(&format!("target monitor {name} is not attached yet; watching for it"));
+    std::thread::spawn(move || {
+        // Forty seconds: long enough for a display to come up, short enough not to fight a user who
+        // is already dragging the notch somewhere on purpose
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            if !monitor_list(&app).iter().any(|(n, _)| *n == name) {
+                continue;
+            }
+            place_notch(&app);
+            applog(&format!("target monitor {name} appeared; notch re-placed"));
+            return;
+        }
+        applog(&format!("target monitor {name} never appeared; the notch stays on the fallback"));
+    });
+}
+
 /// Older entry point name still used by tray.rs
 pub fn reset_bar(app: &AppHandle) {
     {
@@ -814,6 +846,7 @@ fn main() {
         .setup(move |app| {
             let handle = app.handle().clone();
             place_notch(&handle);
+            watch_for_target_monitor(handle.clone());
             noactivate(&handle);
             if let Some(w) = handle.get_webview_window("notch") {
                 let _ = w.show();
