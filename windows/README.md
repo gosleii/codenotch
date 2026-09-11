@@ -56,7 +56,8 @@ The notch is pinned to the **right edge of the primary monitor** by default. The
 left edge the whole surface mirrors — the pill's rounded side and fillets swap over and the hover card
 opens to the right. The choice lives in `config.json` (`monitor`, `edge`, `notch_y`) and survives a
 restart; a monitor that is no longer attached falls back to the primary, so the notch can never end up
-off-screen.
+off-screen. Whatever is chosen is also where it comes back at sign-in, since the position is read from
+the same config.
 
 ## Install / build
 
@@ -68,6 +69,23 @@ cargo build --release
 .\target\release\codenotch.exe          # pill appears on the right edge of the primary monitor
 .\target\release\codenotch.exe doctor   # self-diagnosis: credentials, data sources, icons, hooks
 ```
+
+### Install, and start with Windows
+
+Pointing an autostart entry at `target\release` is asking for trouble: a `cargo clean`, or a rebuild
+while the app is running, leaves the entry aiming at nothing. `install.ps1` copies the release binary
+to `%LOCALAPPDATA%\Programs\Codenotch` and registers *that* copy:
+
+```powershell
+.\install.ps1                 # build, install, start with Windows, launch
+.\install.ps1 -NoAutostart    # build, install, launch
+.\install.ps1 -Uninstall      # remove the Run entry and the installed copy
+```
+
+The entry is a per-user `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` value named
+`Codenotch`, so it needs no administrator and can be turned off from the tray (**Start with Windows**)
+or with `codenotch.exe autostart off`. The command line carries `--silent`, which this port accepts
+and ignores: the notch appears as usual at sign-in.
 
 Tray menu: refresh now, reset position, open data folder (`%APPDATA%\codenotch` — logs,
 persisted readings, icon overrides), start with Windows, install/uninstall Claude Code hooks.

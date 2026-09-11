@@ -1,5 +1,7 @@
 //! Start at sign-in: an HKCU\...\Run registry value (per user, no administrator needed).
-//! The command carries --silent: wait in the background, show no bar without sessions, appear when one starts.
+//! The command carries --silent; this port accepts the flag and ignores it, so the notch appears as
+//! usual at sign-in (it is kept in the command line so the registered entry does not change if a
+//! quiet mode is implemented later).
 //! Implemented with reg.exe, so no new dependency.
 
 use std::process::Command;
