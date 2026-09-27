@@ -2,7 +2,10 @@
 //! Endpoint: GET https://api.anthropic.com/api/oauth/usage
 //! Headers: Authorization: Bearer <token>; anthropic-beta: oauth-2025-04-20; 15 s timeout
 //! Rules (upstream's discipline):
-//!   - the credential comes from Claude Code's own store (Windows: ~/.claude/.credentials.json), read only
+//!   - the credential comes from Claude Code's own store (Windows: ~/.claude/.credentials.json). The desktop
+//!     app never refreshes that file, so an expired token is refreshed here with its refresh token (the same
+//!     request Claude Code makes) and written back, keeping the CLI and this card on one rotating pair
+//!   - a claude-code User-Agent is sent: without it the endpoint answers 429 even for an expired token
 //!   - 401/403 → re-read the credential once and retry (Claude Code may have just refreshed the token) → still failing means needsAuth
 //!   - 429 → back off 60 s × 2^n capped at 15 min, Retry-After only raises it; the deadline is persisted
 //!   - never invent a percentage on failure: keep the last reading marked stale, and the UI shows how old it is
@@ -15,6 +18,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 
 const ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage";
+const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const USER_AGENT: &str = "claude-code/2.1.144";
+/// Claude Code refreshes through plain axios; the token endpoint answers 429 to the claude-code agent
+const REFRESH_USER_AGENT: &str = "axios/1.8.4";
 const POLL_ACTIVE_SECS: u64 = 60;
 const POLL_IDLE_SECS: u64 = 300;
 const BACKOFF_BASE_SECS: u64 = 60;
@@ -107,28 +115,83 @@ fn persist(s: &UsageSnapshot) {
     }
 }
 
+fn credentials_path() -> Option<std::path::PathBuf> {
+    let dir = dirs::home_dir()?.join(".claude");
+    [".credentials.json", "credentials.json"]
+        .into_iter()
+        .map(|n| dir.join(n))
+        .find(|p| p.exists())
+}
+
 /// Reads Claude Code's OAuth credential. Returns (token, expired hint).
 fn read_credentials() -> Option<(String, bool)> {
-    let home = dirs::home_dir()?;
-    for name in [".credentials.json", "credentials.json"] {
-        let p = home.join(".claude").join(name);
-        let Ok(text) = std::fs::read_to_string(&p) else {
-            continue;
-        };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-            continue;
-        };
-        let oauth = v.get("claudeAiOauth").unwrap_or(&v);
-        if let Some(tok) = oauth.get("accessToken").and_then(|x| x.as_str()) {
-            let expired = oauth
-                .get("expiresAt")
-                .and_then(|x| x.as_f64())
-                .map(|ms| (ms as u64) <= now_ms())
-                .unwrap_or(false);
-            return Some((tok.to_string(), expired));
-        }
+    let text = std::fs::read_to_string(credentials_path()?).ok()?;
+    let v = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+    let oauth = v.get("claudeAiOauth").unwrap_or(&v);
+    let tok = oauth.get("accessToken").and_then(|x| x.as_str())?;
+    let expired = oauth
+        .get("expiresAt")
+        .and_then(|x| x.as_f64())
+        // a minute of slack so a token about to lapse is refreshed before the request, not after
+        .map(|ms| (ms as u64) <= now_ms() + 60_000)
+        .unwrap_or(false);
+    Some((tok.to_string(), expired))
+}
+
+/// Trades the stored refresh token for a new pair and writes it back into the same file,
+/// leaving every other field alone. Returns the new access token.
+fn refresh_credentials() -> Result<String, String> {
+    let path = credentials_path().ok_or("no credential file")?;
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("read: {e}"))?;
+    let mut v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))?;
+    let nested = v.get("claudeAiOauth").is_some();
+    let oauth = if nested { &v["claudeAiOauth"] } else { &v };
+    let refresh = oauth
+        .get("refreshToken")
+        .and_then(|x| x.as_str())
+        .ok_or("no refresh token")?
+        .to_string();
+    let scopes: Vec<String> = oauth
+        .get("scopes")
+        .and_then(|x| x.as_array())
+        .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let mut body = serde_json::json!({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh,
+        "client_id": CLIENT_ID,
+    });
+    if !scopes.is_empty() {
+        body["scope"] = scopes.join(" ").into();
     }
-    None
+    let reply: serde_json::Value = ureq::post(TOKEN_URL)
+        .set("User-Agent", REFRESH_USER_AGENT)
+        .timeout(Duration::from_secs(30))
+        .send_json(body)
+        .map_err(|e| match e {
+            ureq::Error::Status(code, _) => format!("token refresh HTTP {code}"),
+            e => format!("token refresh: {e}"),
+        })?
+        .into_json()
+        .map_err(|e| format!("token refresh parse: {e}"))?;
+    let access = reply
+        .get("access_token")
+        .and_then(|x| x.as_str())
+        .ok_or("token refresh: no access_token")?
+        .to_string();
+    let new_refresh = reply.get("refresh_token").and_then(|x| x.as_str()).unwrap_or(&refresh).to_string();
+    let expires_in = reply.get("expires_in").and_then(|x| x.as_u64()).unwrap_or(3600);
+    let oauth = if nested { &mut v["claudeAiOauth"] } else { &mut v };
+    oauth["accessToken"] = access.clone().into();
+    oauth["refreshToken"] = new_refresh.into();
+    oauth["expiresAt"] = (now_ms() + expires_in * 1000).into();
+    // write-then-rename so Claude Code never reads a half-written file
+    let tmp = path.with_extension("json.codenotch-tmp");
+    let out = serde_json::to_string_pretty(&v).map_err(|e| format!("serialize: {e}"))?;
+    std::fs::write(&tmp, out).map_err(|e| format!("write: {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))?;
+    crate::applog("claude usage: access token refreshed");
+    Ok(access)
 }
 
 /// For doctor: credential probe report (prints no secret values)
@@ -229,6 +292,7 @@ fn fetch_once(token: &str) -> Result<Vec<LimitWindow>, FetchErr> {
     let resp = ureq::get(ENDPOINT)
         .set("Authorization", &format!("Bearer {token}"))
         .set("anthropic-beta", "oauth-2025-04-20")
+        .set("User-Agent", USER_AGENT)
         .timeout(Duration::from_secs(15))
         .call();
     match resp {
@@ -296,18 +360,30 @@ pub fn start(app: AppHandle) {
                     u.note = "No Claude Code credential found".into();
                 }),
                 Some((token, expired)) => {
-                    // On 401/403 re-read the credential and retry once (Claude Code may have just refreshed it)
+                    let mut refresh_err = None;
+                    let mut refresh = || match refresh_credentials() {
+                        Ok(t) => Some(t),
+                        Err(e) => {
+                            crate::applog(&format!("claude usage: {e}"));
+                            refresh_err = Some(e);
+                            None
+                        }
+                    };
+                    let token = if expired { refresh().unwrap_or(token) } else { token };
+                    // On 401/403 re-read the credential (Claude Code may have just refreshed it), else refresh it ourselves
                     let result = match fetch_once(&token) {
                         Err(FetchErr::NeedsAuth) => match read_credentials() {
                             Some((t2, _)) if t2 != token => fetch_once(&t2),
-                            _ => Err(FetchErr::NeedsAuth),
+                            _ => match refresh() {
+                                Some(t3) => fetch_once(&t3),
+                                None => Err(FetchErr::NeedsAuth),
+                            },
                         },
                         other => other,
                     };
-                    let auth_note = if expired {
-                        "Credential expired — run any claude command (or chat with Claude) to refresh it"
-                    } else {
-                        "Credential rejected (switched accounts?)"
+                    let auth_note = match &refresh_err {
+                        Some(e) => format!("Credential expired and refresh failed ({e}) — run `claude` once to sign in again"),
+                        None => "Credential rejected (switched accounts?)".into(),
                     };
                     match result {
                         Ok(windows) => {
@@ -322,7 +398,7 @@ pub fn start(app: AppHandle) {
                         }
                         Err(FetchErr::NeedsAuth) => set_and_broadcast(&app, |u| {
                             u.status = "needsAuth".into();
-                            u.note = auth_note.into();
+                            u.note = auth_note;
                         }),
                         Err(FetchErr::RateLimited(ra)) => {
                             consecutive_429 += 1;
