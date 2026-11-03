@@ -32,9 +32,15 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 
+#[cfg(windows)]
+#[path = "codex_http.rs"]
+mod http;
+
 const POLL_SECS: u64 = 300; // Codex has no session state to key off, so a fixed 5 min (upstream cadence; a tray refresh interrupts it)
+const RETRY_SECS: u64 = 30;
 const TAIL_BYTES: u64 = 256 * 1024;
 const CURRENT_FOR_MS: u64 = 5 * 60 * 1000;
+#[cfg(not(windows))]
 const ENDPOINT: &str = "https://chatgpt.com/backend-api/wham/usage";
 const BACKOFF_MIN_SECS: u64 = 60; // wait at least this long after a 429; Retry-After only raises it
 
@@ -69,6 +75,7 @@ pub fn load_persisted() -> UsageSnapshot {
             if !s.windows.is_empty() {
                 s.status = "stale".into();
             }
+            remove_expired_windows(&mut s, now_ms());
             BACKOFF_UNTIL.store(s.backoff_until, std::sync::atomic::Ordering::Relaxed);
             s
         })
@@ -170,6 +177,7 @@ fn load_credential() -> Option<Credential> {
     Some(Credential { access_token, account_id, plan, expired })
 }
 
+#[derive(Debug)]
 enum LiveErr {
     NeedsAuth,
     /// Suggested wait in seconds (BACKOFF_MIN_SECS already applied)
@@ -177,6 +185,26 @@ enum LiveErr {
     Other(String),
 }
 
+#[cfg(windows)]
+fn fetch_usage(cred: &Credential) -> Result<serde_json::Value, LiveErr> {
+    let headers = format!("Authorization: Bearer {}\r\nChatGPT-Account-Id: {}\r\nAccept: application/json\r\nCache-Control: no-cache, no-store\r\n",
+        cred.access_token, cred.account_id);
+    let response = http::get("chatgpt.com", 443, "/backend-api/wham/usage", true, &headers)
+        .map_err(LiveErr::Other)?;
+    response_from_parts(response.status, response.retry_after, &response.body)
+}
+
+#[cfg(any(windows, test))]
+fn response_from_parts(status: u32, retry_after: Option<u64>, body: &[u8]) -> Result<serde_json::Value, LiveErr> {
+    match status {
+        200..=299 => serde_json::from_slice(body).map_err(|_| LiveErr::Other("Invalid usage response".into())),
+        401 | 403 => Err(LiveErr::NeedsAuth),
+        429 => Err(LiveErr::RateLimited(retry_after.unwrap_or(0).max(BACKOFF_MIN_SECS))),
+        code => Err(LiveErr::Other(format!("HTTP {code}"))),
+    }
+}
+
+#[cfg(not(windows))]
 fn fetch_usage(cred: &Credential) -> Result<serde_json::Value, LiveErr> {
     let resp = ureq::get(ENDPOINT)
         .set("Authorization", &format!("Bearer {}", cred.access_token))
@@ -337,7 +365,7 @@ pub fn snapshot_from_rollout(text: &str) -> Option<(Vec<LimitWindow>, Option<u64
             .and_then(|x| x.as_str())
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|d| d.timestamp_millis().max(0) as u64);
-        let now = now_ms();
+        let now = recorded.unwrap_or_else(now_ms);
         let mut out = Vec::new();
         for id in ["primary", "secondary"] {
             let Some(w) = rl.get(id).filter(|x| x.is_object()) else { continue };
@@ -456,7 +484,41 @@ fn read_once() -> UsageSnapshot {
             };
         }
     }
-    snap
+    let cached = std::fs::read_to_string(store_path()).ok()
+        .and_then(|text| serde_json::from_str(&text).ok());
+    fallback_with_cache(snap, cached, now_ms())
+}
+
+/// A transient outage must never roll usage back to an older transcript snapshot.
+fn fallback_with_cache(mut fallback: UsageSnapshot, cached: Option<UsageSnapshot>, now: u64) -> UsageSnapshot {
+    if let Some(mut cached) = cached.filter(|c| !c.windows.is_empty() && c.fetched_at > fallback.fetched_at) {
+        cached.backoff_until = fallback.backoff_until;
+        cached.note = "Live update unavailable — retrying automatically · last confirmed Codex reading".into();
+        fallback = cached;
+    }
+    if !fallback.windows.is_empty() { fallback.status = "stale".into(); }
+    remove_expired_windows(&mut fallback, now);
+    fallback
+}
+
+fn remove_expired_windows(snap: &mut UsageSnapshot, now: u64) {
+    let before = snap.windows.len();
+    snap.windows.retain(|w| w.resets_at.map(|at| at > now).unwrap_or(true));
+    if before > 0 && snap.windows.is_empty() {
+        snap.status = "none".into();
+        snap.note = "Usage reading expired — retrying automatically".into();
+    }
+}
+
+fn poll_delay(snap: &UsageSnapshot, now: u64) -> u64 {
+    let cadence = if snap.status == "ok" { POLL_SECS } else { RETRY_SECS };
+    cadence.max(snap.backoff_until.saturating_sub(now).div_ceil(1000))
+}
+
+/// Explicit read-only diagnosis, without starting the GUI or changing the saved reading.
+pub fn check_live() -> String {
+    let _ = load_persisted(); // diagnostic commands also honor persisted Retry-After
+    serde_json::to_string_pretty(&read_once()).unwrap_or_else(|_| "Usage check failed".into())
 }
 
 fn cap(s: &str) -> String {
@@ -508,9 +570,9 @@ pub fn start(app: AppHandle) {
                 continue;
             }
             let snap = read_once();
-            let hold = snap.backoff_until.saturating_sub(now_ms()) / 1000;
+            let delay = poll_delay(&snap, now_ms());
             broadcast(&app, snap);
-            for _ in 0..POLL_SECS.max(hold) {
+            for _ in 0..delay {
                 if REFRESH.swap(false, std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
@@ -546,4 +608,72 @@ pub fn probe() -> String {
         roll.map(|p| p.display().to_string()).unwrap_or_else(|| "none".into()),
         age
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(at: u64, used: f64, reset: u64) -> UsageSnapshot {
+        UsageSnapshot { status:"ok".into(),fetched_at:at,
+            windows:vec![LimitWindow { id:"primary".into(),used,resets_at:Some(reset),..Default::default() }],
+            ..Default::default() }
+    }
+
+    #[test]
+    fn outage_keeps_newest_reading_and_marks_it_stale() {
+        let old = snapshot(100,0.93,10_000);
+        let cache = snapshot(200,0.06,10_000);
+        let result = fallback_with_cache(old,Some(cache),300);
+        assert_eq!(result.windows[0].used,0.06);
+        assert_eq!(result.fetched_at,200);
+        assert_eq!(result.status,"stale");
+    }
+
+    #[test]
+    fn newer_rollout_wins_over_cache() {
+        let result = fallback_with_cache(snapshot(200,0.40,10_000),Some(snapshot(100,0.07,10_000)),300);
+        assert_eq!(result.windows[0].used,0.40);
+        assert_eq!(result.fetched_at,200);
+    }
+
+    #[test]
+    fn expired_window_is_not_shown_as_current_usage() {
+        let mut saved = snapshot(100,0.93,200);
+        saved.windows.push(LimitWindow { id:"secondary".into(),used:0.07,resets_at:Some(10_000),..Default::default() });
+        let result = fallback_with_cache(UsageSnapshot::default(),Some(saved),300);
+        assert_eq!(result.windows.len(),1);
+        assert_eq!(result.windows[0].id,"secondary");
+        let result = fallback_with_cache(result,None,20_000);
+        assert!(result.windows.is_empty());
+        assert_eq!(result.status,"none");
+    }
+
+    #[test]
+    fn failure_retries_soon_but_respects_server_backoff() {
+        let mut snap = snapshot(100,0.01,10_000);
+        snap.status="stale".into();
+        assert_eq!(poll_delay(&snap,1000),30);
+        snap.backoff_until=121_001;
+        assert_eq!(poll_delay(&snap,1000),121);
+        let result = fallback_with_cache(snap,Some(snapshot(200,0.02,10_000)),1000);
+        assert_eq!(result.backoff_until,121_001);
+    }
+
+    #[test]
+    fn usage_errors_preserve_auth_and_rate_limit_semantics() {
+        assert!(matches!(response_from_parts(401,None,b""),Err(LiveErr::NeedsAuth)));
+        assert!(matches!(response_from_parts(403,None,b""),Err(LiveErr::NeedsAuth)));
+        assert!(matches!(response_from_parts(429,Some(120),b""),Err(LiveErr::RateLimited(120))));
+        assert!(matches!(response_from_parts(429,None,b""),Err(LiveErr::RateLimited(60))));
+        assert!(response_from_parts(200,None,b"not json").is_err());
+        assert_eq!(response_from_parts(200,None,b"{\"plan_type\":\"plus\"}").unwrap()["plan_type"],"plus");
+    }
+
+    #[test]
+    fn relative_rollout_reset_stays_anchored_to_recording_time() {
+        let raw = r#"{"timestamp":"2026-10-19T00:00:00Z","payload":{"rate_limits":{"primary":{"used_percent":93,"window_minutes":300,"resets_in_seconds":60}}}}"#;
+        let (windows, recorded, _) = snapshot_from_rollout(raw).unwrap();
+        assert_eq!(windows[0].resets_at,Some(recorded.unwrap()+60_000));
+    }
 }

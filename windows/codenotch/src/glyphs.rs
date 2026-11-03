@@ -7,7 +7,7 @@
 //!   3. The installed application's own icon (PrivateExtractIconsW on the exe resources, 64 px → PNG);
 //!   none of those → the page falls back to a letter.
 //! SVGs are inlined into the DOM as text (`fill="currentColor"` follows the CSS white/dimmed state);
-//! PNGs and app icons go through <img>. Ids match the page and upstream: claude / codex / cursor / gemini.
+//! PNGs and app icons go through <img>. Ids match the page: codex / cursor / gemini / deepseek / kimi.
 
 use serde::Serialize;
 use std::collections::HashMap;
@@ -25,15 +25,15 @@ pub struct Glyph {
     pub source: String,
 }
 
-pub const IDS: [&str; 5] = ["claude", "codex", "cursor", "gemini", "deepseek"];
+pub const IDS: [&str; 5] = ["codex", "cursor", "gemini", "deepseek", "kimi"];
 
-/// Built-in artwork (@lobehub/icons-static-svg, MIT): the OpenAI mark for codex (matching upstream's glyph choice), the Antigravity mark for gemini, the whale for DeepSeek
+/// Built-in artwork (@lobehub/icons-static-svg, MIT): the OpenAI mark for codex (matching upstream's glyph choice), the Antigravity mark for gemini, the whale for DeepSeek, the Kimi mark for Kimi Code
 const BUILTIN: [(&str, &str); 5] = [
-    ("claude", include_str!("../glyphs/claude.svg")),
     ("codex", include_str!("../glyphs/codex.svg")),
     ("cursor", include_str!("../glyphs/cursor.svg")),
     ("gemini", include_str!("../glyphs/gemini.svg")),
     ("deepseek", include_str!("../glyphs/deepseek.svg")),
+    ("kimi", include_str!("../glyphs/kimi.svg")),
 ];
 
 /// Minimal SVG sanitising before inlining into the DOM: drop <script> blocks and on*="…" event
@@ -140,18 +140,6 @@ fn app_candidates(id: &str) -> Vec<PathBuf> {
     let Some(local) = dirs::data_local_dir() else { return v };
     let programs = local.join("Programs");
     match id {
-        "claude" => {
-            v.push(local.join("AnthropicClaude").join("claude.exe"));
-            if let Ok(rd) = std::fs::read_dir(local.join("AnthropicClaude")) {
-                for e in rd.flatten() {
-                    if e.file_name().to_string_lossy().starts_with("app-") {
-                        v.push(e.path().join("claude.exe"));
-                    }
-                }
-            }
-            v.push(programs.join("Claude").join("Claude.exe"));
-            v.push(programs.join("claude-desktop").join("Claude.exe"));
-        }
         "codex" => {
             v.push(programs.join("ChatGPT").join("ChatGPT.exe"));
             v.push(programs.join("Codex").join("Codex.exe"));
@@ -166,6 +154,9 @@ fn app_candidates(id: &str) -> Vec<PathBuf> {
         "gemini" => {
             v.push(programs.join("Antigravity").join("Antigravity.exe"));
             v.push(programs.join("antigravity").join("Antigravity.exe"));
+        }
+        "kimi" => {
+            v.push(programs.join("Kimi Code").join("Kimi Code.exe"));
         }
         _ => {}
     }
@@ -306,7 +297,7 @@ pub fn collect() -> HashMap<String, Glyph> {
 /// For doctor
 pub fn probe() -> String {
     let m = collect();
-    let mut lines = vec![format!("glyph directory: {} (drop claude/codex/cursor/gemini/deepseek .svg or .png files here)", user_dir().display())];
+    let mut lines = vec![format!("glyph directory: {} (drop codex/cursor/gemini/deepseek/kimi .svg or .png files here)", user_dir().display())];
     for id in IDS {
         lines.push(match m.get(id) {
             Some(g) => format!("  {id}: {} ← {}", g.kind, g.source),

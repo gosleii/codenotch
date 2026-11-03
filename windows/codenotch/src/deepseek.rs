@@ -2,7 +2,7 @@
 //!
 //! Endpoint: GET https://api.deepseek.com/user/balance — Bearer <api key>, 15 s timeout.
 //!
-//! DeepSeek publishes no Claude-style rate-limit windows: the API is prepaid, so the only number
+//! DeepSeek publishes no subscription-style rate-limit windows: the API is prepaid, so the only number
 //! the account itself will tell you is what is left on it. The cell therefore shows the balance,
 //! and when the user declares a budget the ring becomes a "budget used" percentage — that
 //! denominator is ours, not the vendor's, so the window is flagged derived (the card adds "~").
@@ -21,7 +21,7 @@
 //!   4. config.json                         { "deepseek_key": "sk-…", "deepseek_budget": 20.0 }
 //! The app never writes a key anywhere, and the key is never logged or put in an error message.
 //!
-//! Failure discipline matches the Claude adapter: 401/403 → needsAuth, 429 → exponential backoff
+//! Failure discipline matches the other adapters: 401/403 → needsAuth, 429 → exponential backoff
 //! with the deadline persisted, anything else → keep the last reading marked stale rather than
 //! invent a number.
 
@@ -475,9 +475,8 @@ pub fn start(app: AppHandle) {
             // A balance moves far slower than a rate-limit window: one poll per five minutes is plenty
             let active = {
                 let st = app.state::<AppState>();
-                let store = st.store.lock().unwrap();
-                let s = store.snapshot("en", "en", false);
-                !s.sessions.is_empty()
+                let busy = st.activity.lock().unwrap().iter().any(|a| a.state == "busy");
+                busy
             };
             sleep_interruptible(if active { 60 } else { POLL_SECS });
         }

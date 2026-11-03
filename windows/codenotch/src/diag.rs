@@ -135,22 +135,12 @@ fn dump_json_scalars(path: &Path) -> String {
 }
 
 pub fn run() -> String {
-    let mut o = String::from("== doctor deep: working-state signal survey ==\n(run it while both the Codex desktop app and the Claude desktop app are working)\n\n");
+    let mut o = String::from("== doctor deep: working-state signal survey ==\n(run it while the Codex desktop app is working)\n\n");
     let home = dirs::home_dir().unwrap_or_default();
-    let local = dirs::data_local_dir().unwrap_or_default();
 
     o += "## Files modified in the last 120 s\n";
     let mut recent = Vec::new();
     recent_files(&home.join(".codex"), 2, 120, &mut recent);
-    if let Ok(rd) = std::fs::read_dir(local.join("Packages")) {
-        for e in rd.flatten() {
-            let n = e.file_name().to_string_lossy().to_lowercase();
-            if n.contains("claude") || n.contains("anthropic") {
-                recent_files(&e.path().join("LocalCache").join("Roaming").join("Claude"), 3, 120, &mut recent);
-            }
-        }
-    }
-    recent_files(&dirs::config_dir().unwrap_or_default().join("Claude"), 2, 120, &mut recent);
     recent_files(&dirs::config_dir().unwrap_or_default().join("Cursor").join("User").join("globalStorage"), 1, 120, &mut recent);
     recent.sort();
     for (age, p) in recent.iter().take(60) {

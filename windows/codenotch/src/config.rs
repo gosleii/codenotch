@@ -35,7 +35,7 @@ pub struct Config {
     /// derived "budget used" percentage. 0 keeps the cell on the vendor's balance number.
     #[serde(default)]
     pub deepseek_budget: f64,
-    /// Provider ids the user switched off ("claude", "codex", "cursor", "gemini", "deepseek").
+    /// Provider ids the user switched off ("codex", "cursor", "gemini", "deepseek", "kimi").
     /// A hidden provider draws no cell, stops polling, and stops being probed for activity — the
     /// point of hiding Cursor is not to keep opening its SQLite every few seconds.
     #[serde(default)]
@@ -44,11 +44,11 @@ pub struct Config {
 
 /// Ids the page and the tray agree on, in the order the pill draws them
 pub const PROVIDERS: [(&str, &str); 5] = [
-    ("claude", "Claude"),
     ("codex", "Codex"),
     ("cursor", "Cursor"),
     ("gemini", "Antigravity"),
     ("deepseek", "DeepSeek"),
+    ("kimi", "Kimi"),
 ];
 
 /// Is this provider switched off? Read from disk, so a toggle takes effect without a restart
@@ -130,7 +130,7 @@ mod tests {
         let cfg = Config { hidden: vec!["cursor".into(), "gemini".into()], ..Default::default() };
         assert!(hidden_in(&cfg, "cursor"));
         assert!(hidden_in(&cfg, "gemini"));
-        assert!(!hidden_in(&cfg, "claude"));
+        assert!(!hidden_in(&cfg, "kimi"));
     }
 
     #[test]
@@ -143,6 +143,6 @@ mod tests {
     #[test]
     fn the_provider_table_matches_the_page_ids() {
         let ids: Vec<&str> = PROVIDERS.iter().map(|(id, _)| *id).collect();
-        assert_eq!(ids, vec!["claude", "codex", "cursor", "gemini", "deepseek"]);
+        assert_eq!(ids, vec!["codex", "cursor", "gemini", "deepseek", "kimi"]);
     }
 }

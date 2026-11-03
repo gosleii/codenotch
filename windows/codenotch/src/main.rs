@@ -3,21 +3,18 @@
 mod autostart;
 mod config;
 mod doctor;
-mod focus;
-mod hooks_install;
 mod i18n;
 mod server;
-mod state;
 mod tray;
 mod usage;
 mod deepseek;
+mod kimi;
 mod codex;
 mod cursor;
 mod antigravity;
 mod glyphs;
 mod activity;
 mod diag;
-mod watcher;
 
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager};
@@ -25,41 +22,23 @@ use tauri::{AppHandle, Emitter, Manager};
 /// Logical size of the notch window: the 70 pt pill column on the right plus room for the hover card on the left.
 pub const NOTCH_W: f64 = 340.0;
 /// Hand-bumped build tag, written to run.log at startup so a log can always be matched to the exe that wrote it.
-pub const BUILD: &str = "r31";
+pub const BUILD: &str = "r34";
 pub const NOTCH_H: f64 = 460.0; // 300 clipped the card once it held three window blocks plus the session list
 
 pub struct AppState {
-    pub store: Mutex<state::Store>,
     pub cfg: Mutex<config::Config>,
-    pub usage: Mutex<usage::UsageSnapshot>,
     /// Codex snapshot (same UsageSnapshot shape; status may also be none/absent)
     pub codex: Mutex<usage::UsageSnapshot>,
     pub cursor: Mutex<usage::UsageSnapshot>,
     pub antigravity: Mutex<usage::UsageSnapshot>,
     /// DeepSeek API snapshot (balance; "absent" while no key is configured)
     pub deepseek: Mutex<usage::UsageSnapshot>,
+    /// Kimi Code snapshot (quota windows via its local server; "absent" while the server is not running)
+    pub kimi: Mutex<usage::UsageSnapshot>,
     /// Provider glyph cache, collected at launch and again on a tray refresh
     pub glyphs: Mutex<std::collections::HashMap<String, glyphs::Glyph>>,
-    /// Working state of the non-Claude providers (Cursor reports it; Codex and Antigravity are inferred from recent writes)
+    /// Working state of the providers (Cursor reports it; Codex and Antigravity are inferred from recent writes)
     pub activity: Mutex<Vec<activity::Activity>>,
-}
-
-fn resolved_lang(raw: &str) -> String {
-    if raw == "auto" {
-        i18n::resolve_auto().to_string()
-    } else {
-        raw.to_string()
-    }
-}
-
-pub fn broadcast(app: &AppHandle) {
-    let st = app.state::<AppState>();
-    let snap = {
-        let store = st.store.lock().unwrap();
-        let cfg = st.cfg.lock().unwrap();
-        store.snapshot(&cfg.lang, &resolved_lang(&cfg.lang), false)
-    };
-    let _ = app.emit("state", &snap);
 }
 
 /// The monitor the notch is pinned to: the one named in the config, else the primary. A monitor
@@ -155,31 +134,44 @@ pub fn place_notch(app: &AppHandle) {
 /// still waking up, and a dock or a KVM can take seconds to report itself. `place_notch` falls back
 /// to the primary in that case, which is how "it came up on the wrong screen" happens: the setting
 /// is right, the display simply was not there yet. So when the target is missing at startup, keep
-/// looking for a while and re-place the moment it turns up.
+/// looking and re-place the moment it turns up. A fixed forty-second window was not enough: a
+/// display that wakes a minute after sign-in left the notch on the primary for the whole day. So
+/// the watch never gives up, and it also catches a display unplugged and plugged back later.
 fn watch_for_target_monitor(app: AppHandle) {
-    let name = {
-        let st = app.state::<AppState>();
-        let c = st.cfg.lock().unwrap();
-        c.monitor.clone()
-    };
-    let Some(name) = name else { return }; // no name configured means the primary, which is always there
-    if monitor_list(&app).iter().any(|(n, _)| *n == name) {
-        return;
-    }
-    applog(&format!("target monitor {name} is not attached yet; watching for it"));
     std::thread::spawn(move || {
-        // Forty seconds: long enough for a display to come up, short enough not to fight a user who
-        // is already dragging the notch somewhere on purpose
-        for _ in 0..20 {
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            if !monitor_list(&app).iter().any(|(n, _)| *n == name) {
+        let mut missing = false;
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            let name = {
+                let st = app.state::<AppState>();
+                let c = st.cfg.lock().unwrap();
+                c.monitor.clone()
+            };
+            let Some(name) = name else { continue }; // the primary is always there
+            let Some(w) = app.get_webview_window("notch") else { continue };
+            let Some(mon) = w
+                .available_monitors()
+                .ok()
+                .and_then(|ms| ms.into_iter().find(|m| m.name().map(|n| *n == name).unwrap_or(false)))
+            else {
+                if !missing {
+                    applog(&format!("target monitor {name} is not attached; watching for it"));
+                    missing = true;
+                }
                 continue;
+            };
+            // Already on the target monitor: nothing to do (and nothing to fight if the pill was dragged along it)
+            let (p, s) = (mon.position(), mon.size());
+            let on_target = w
+                .outer_position()
+                .map(|o| o.x >= p.x && o.x < p.x + s.width as i32 && o.y >= p.y && o.y < p.y + s.height as i32)
+                .unwrap_or(true);
+            if !on_target {
+                place_notch(&app);
+                applog(&format!("target monitor {name} is attached; notch re-placed"));
             }
-            place_notch(&app);
-            applog(&format!("target monitor {name} appeared; notch re-placed"));
-            return;
+            missing = false;
         }
-        applog(&format!("target monitor {name} never appeared; the notch stays on the fallback"));
     });
 }
 
@@ -279,7 +271,6 @@ pub fn apply_lang(app: &AppHandle, lang: &str) {
             let _ = tray.set_menu(Some(menu));
         }
     }
-    broadcast(app);
 }
 
 /// The notch must never take focus: WS_EX_NOACTIVATE + WS_EX_TOOLWINDOW
@@ -309,29 +300,13 @@ fn noactivate(_app: &AppHandle) {}
 // ---------------- commands ----------------
 
 #[tauri::command]
-fn get_state(state: tauri::State<AppState>) -> state::Snapshot {
-    let store = state.store.lock().unwrap();
-    let cfg = state.cfg.lock().unwrap();
-    store.snapshot(&cfg.lang, &resolved_lang(&cfg.lang), false)
+fn get_codex(state: tauri::State<AppState>) -> usage::UsageSnapshot {
+    state.codex.lock().unwrap().clone()
 }
 
 #[tauri::command]
-fn get_usage(state: tauri::State<AppState>) -> usage::UsageSnapshot {
-    state.usage.lock().unwrap().clone()
-}
-
-#[tauri::command]
-fn refresh_usage(app: AppHandle) {
-    {
-        let st = app.state::<AppState>();
-        let mut u = st.usage.lock().unwrap();
-        u.backoff_until = 0;
-    }
-    usage::request_refresh();
-    codex::request_refresh();
-    cursor::request_refresh();
-    antigravity::request_refresh();
-    deepseek::request_refresh();
+fn get_kimi(state: tauri::State<AppState>) -> usage::UsageSnapshot {
+    state.kimi.lock().unwrap().clone()
 }
 
 #[tauri::command]
@@ -453,11 +428,6 @@ fn get_cursor(state: tauri::State<AppState>) -> usage::UsageSnapshot {
     state.cursor.lock().unwrap().clone()
 }
 
-#[tauri::command]
-fn get_codex(state: tauri::State<AppState>) -> usage::UsageSnapshot {
-    state.codex.lock().unwrap().clone()
-}
-
 /// A click on a cell opens that provider's usage page
 #[tauri::command]
 fn open_provider_page(provider: String) {
@@ -466,7 +436,8 @@ fn open_provider_page(provider: String) {
         "cursor" => "https://cursor.com/dashboard",
         "gemini" => "https://antigravity.google",
         "deepseek" => "https://platform.deepseek.com/usage",
-        _ => "https://claude.ai/settings/usage",
+        "kimi" => "https://www.kimi.com/code",
+        _ => "https://www.kimi.com/code",
     };
     let mut cmd = std::process::Command::new("cmd");
     cmd.args(["/C", "start", "", url]);
@@ -666,76 +637,8 @@ fn log_js(msg: String) {
 }
 
 #[tauri::command]
-fn open_usage_page() {
-    let mut cmd = std::process::Command::new("cmd");
-    cmd.args(["/C", "start", "", "https://claude.ai/settings/usage"]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
-    let _ = cmd.spawn();
-}
-
-#[tauri::command]
-fn focus_session(app: AppHandle, id: String) -> bool {
-    let ppid = {
-        let st = app.state::<AppState>();
-        let store = st.store.lock().unwrap();
-        store.ppid_of(&id)
-    };
-    match ppid {
-        Some(p) => focus::focus_terminal(p),
-        None => focus::focus_claude_desktop(),
-    }
-}
-
-#[tauri::command]
-fn dismiss_session(app: AppHandle, id: String) {
-    {
-        let st = app.state::<AppState>();
-        let mut store = st.store.lock().unwrap();
-        store.dismiss(&id);
-    }
-    broadcast(&app);
-}
-
-#[tauri::command]
 fn set_lang(app: AppHandle, lang: String) {
     apply_lang(&app, &lang);
-}
-
-/// Seen-clears-it: looking at a session acknowledges it (engine behaviour, unchanged)
-#[cfg(windows)]
-fn ack_scan(app: &AppHandle) -> bool {
-    let need = {
-        let st = app.state::<AppState>();
-        let store = st.store.lock().unwrap();
-        store.has_done()
-    };
-    if !need {
-        return false;
-    }
-    let fg = focus::fg_pid();
-    if fg == 0 {
-        return false;
-    }
-    let maps = focus::proc_maps();
-    let fg_name = maps.name.get(&fg).cloned().unwrap_or_default();
-    let fg_is_claude_desktop = fg_name.contains("claude") && !fg_name.contains("codenotch");
-    let st = app.state::<AppState>();
-    let mut store = st.store.lock().unwrap();
-    store.ack_done(|s| {
-        if s.ppid == 0 {
-            fg_is_claude_desktop
-        } else {
-            focus::pid_hits_chain(fg, &focus::chain_of(s.ppid, &maps.ppid), &maps)
-        }
-    })
-}
-#[cfg(not(windows))]
-fn ack_scan(_app: &AppHandle) -> bool {
-    false
 }
 
 // ---------------- main ----------------
@@ -765,14 +668,6 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if let Some(cmd) = args.get(1) {
         match cmd.as_str() {
-            "install-hooks" => {
-                report(hooks_install::install());
-                return;
-            }
-            "uninstall-hooks" => {
-                report(hooks_install::uninstall());
-                return;
-            }
             "autostart" => {
                 let r = match args.get(2).map(|s| s.as_str()) {
                     Some("on") => autostart::enable(),
@@ -787,11 +682,20 @@ fn main() {
                 println!("{}", deepseek::check_live(args.get(2).map(|s| s.as_str()).unwrap_or("")));
                 return;
             }
+            // One live quota round trip through the Kimi Code local server, without the GUI
+            "kimi" => {
+                println!("{}", kimi::check_live());
+                return;
+            }
             "doctor" => {
                 let out = if args.get(2).map(|s| s.as_str()) == Some("deep") { diag::run() } else { doctor::run() };
                 println!("{out}");
                 let log = config::config_path().with_file_name("doctor.log");
                 let _ = std::fs::write(log, &out);
+                return;
+            }
+            "codex" => {
+                println!("{}", codex::check_live());
                 return;
             }
             _ => {}
@@ -809,20 +713,18 @@ fn main() {
             let _ = app.emit("notice", format!("Codenotch is already running ({BUILD}) — quit it from the tray before starting a new build"));
         }))
         .manage(AppState {
-            store: Mutex::new(Default::default()),
             cfg: Mutex::new(cfg),
-            usage: Mutex::new(usage::load_persisted()),
             codex: Mutex::new(codex::load_persisted()),
             cursor: Mutex::new(cursor::load_persisted()),
             antigravity: Mutex::new(antigravity::load_persisted()),
             deepseek: Mutex::new(deepseek::load_persisted()),
+            kimi: Mutex::new(kimi::load_persisted()),
             glyphs: Mutex::new(Default::default()),
             activity: Mutex::new(Vec::new()),
         })
         .invoke_handler(tauri::generate_handler![
-            get_state,
-            get_usage,
             get_codex,
+            get_kimi,
             get_cursor,
             get_antigravity,
             get_deepseek,
@@ -834,13 +736,9 @@ fn main() {
             open_data_dir,
             drag_begin,
             open_provider_page,
-            refresh_usage,
-            open_usage_page,
             set_hot,
             report_dpr,
             log_js,
-            focus_session,
-            dismiss_session,
             set_lang
         ])
         .setup(move |app| {
@@ -853,47 +751,16 @@ fn main() {
             }
             tray::setup(&handle)?;
             server::start(handle.clone(), port);
-            watcher::start(handle.clone());
-            usage::start(handle.clone());
             codex::start(handle.clone());
             cursor::start(handle.clone());
             antigravity::start(handle.clone());
             deepseek::start(handle.clone());
+            kimi::start(handle.clone());
             activity::start(handle.clone());
             // Collecting glyphs may read icon resources out of a few executables; do it off the main thread and push when done
             let gh = handle.clone();
             std::thread::spawn(move || reload_glyphs(&gh));
             start_pointer_watchdog(handle.clone());
-            // Seen-clears-it scan
-            let acker = handle.clone();
-            std::thread::spawn(move || {
-                activity::lower_thread_priority();
-                loop {
-                    std::thread::sleep(std::time::Duration::from_millis(1500));
-                    if ack_scan(&acker) {
-                        broadcast(&acker);
-                    }
-                }
-            });
-            // Stale session cleanup
-            let sweeper = handle.clone();
-            std::thread::spawn(move || loop {
-                std::thread::sleep(std::time::Duration::from_secs(30));
-                let changed = {
-                    let st = sweeper.state::<AppState>();
-                    let mut s = st.store.lock().unwrap();
-                    s.sweep()
-                };
-                if changed {
-                    broadcast(&sweeper);
-                }
-            });
-            // Persist the config (codenotch-hook reads the port from it)
-            {
-                let st = handle.state::<AppState>();
-                let c = st.cfg.lock().unwrap();
-                config::save(&c);
-            }
             Ok(())
         })
         .run(tauri::generate_context!())

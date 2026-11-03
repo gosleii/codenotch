@@ -1,8 +1,7 @@
-use crate::hooks_install;
 use crate::i18n::tr;
 use tauri::menu::{CheckMenuItemBuilder, Menu, MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Emitter, Manager, Wry};
+use tauri::{AppHandle, Manager, Wry};
 
 pub fn setup(app: &AppHandle) -> tauri::Result<()> {
     let lang = {
@@ -23,8 +22,6 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
 }
 
 pub fn build_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
-    let install = MenuItemBuilder::with_id("install", tr(lang, "install")).build(app)?;
-    let uninstall = MenuItemBuilder::with_id("uninstall", tr(lang, "uninstall")).build(app)?;
     let l_auto = CheckMenuItemBuilder::with_id("lang-auto", tr(lang, "lang_auto"))
         .checked(lang == "auto")
         .build(app)?;
@@ -99,8 +96,6 @@ pub fn build_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
         .build(app)?;
     let quit = MenuItemBuilder::with_id("quit", tr(lang, "quit")).build(app)?;
     MenuBuilder::new(app)
-        .items(&[&install, &uninstall])
-        .separator()
         .item(&lang_menu)
         .item(&refresh)
         .item(&providers_menu)
@@ -129,8 +124,6 @@ fn refresh_menu(app: &AppHandle) {
 
 fn handle(app: &AppHandle, id: &str) {
     match id {
-        "install" => notice(app, hooks_install::install()),
-        "uninstall" => notice(app, hooks_install::uninstall()),
         "reset" => crate::reset_bar(app),
         "open-data" => {
             let dir = crate::config::config_path().parent().map(|p| p.to_path_buf()).unwrap_or_default();
@@ -145,16 +138,11 @@ fn handle(app: &AppHandle, id: &str) {
             let _ = cmd.spawn();
         }
         "refresh" => {
-            {
-                let st = app.state::<crate::AppState>();
-                let mut u = st.usage.lock().unwrap();
-                u.backoff_until = 0;
-            }
-            crate::usage::request_refresh();
             crate::codex::request_refresh();
             crate::cursor::request_refresh();
             crate::antigravity::request_refresh();
             crate::deepseek::request_refresh();
+            crate::kimi::request_refresh();
             let a = app.clone();
             std::thread::spawn(move || crate::reload_glyphs(&a));
         }
@@ -167,8 +155,7 @@ fn handle(app: &AppHandle, id: &str) {
             notice(app, r);
             refresh_menu(app); // refresh the check marks
         }
-        "quit" => app.exit(0),
-        _ if id.starts_with("lang-") => crate::apply_lang(app, &id[5..]),
+        "quit" => app.exit(0),        _ if id.starts_with("lang-") => crate::apply_lang(app, &id[5..]),
         // "mon-" with an empty remainder is the primary monitor; otherwise the name follows verbatim
         _ if id.starts_with("mon-") => {
             {
@@ -210,10 +197,11 @@ fn handle(app: &AppHandle, id: &str) {
     }
 }
 
+/// A tray action's result, shown on the notch itself (the tray menu gives no feedback surface)
 fn notice(app: &AppHandle, r: Result<String, String>) {
     let msg = match r {
         Ok(m) => m,
         Err(e) => format!("Error: {e}"),
     };
-    let _ = app.emit("notice", &msg);
+    let _ = tauri::Emitter::emit(app, "notice", &msg);
 }

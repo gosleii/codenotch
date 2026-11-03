@@ -1,5 +1,43 @@
 # Codenotch — Tasks
 
+## Replace Claude with Kimi Code (account banned) — 2026-11-03
+
+- [x] Remove the Claude provider end to end: usage adapter (`usage.rs` reduced to the shared `UsageSnapshot`/`LimitWindow` types), transcript watcher, session store, focus/jump-back, hooks installer, `codenotch-hook` crate, hook tray items and CLI commands, session list UI, Claude glyph.
+  Evidence: modules deleted (`watcher.rs`, `state.rs`, `focus.rs`, `hooks_install.rs`, `codenotch-hook/`); `notify` dependency dropped; `open_provider_page` has no claude arm; `config::PROVIDERS` is codex/cursor/gemini/deepseek/kimi.
+- [x] Add the Kimi Code cell: quota via the Kimi Code local server `GET /api/v1/oauth/usage` on 127.0.0.1 (port from the freshest live `~/.kimi-code/server/instances/*.json`, `Authorization: Bearer ~/.kimi-code/server.token`), mapping `limit5h` / `monthCode` / `monthTotal` (`usedRatio`, `resetAt`) onto windows; `absent` (no cell) while the server is not running; 401 → needsAuth; 429 → persisted backoff; anything else keeps the last reading stale. Read-only: the token never leaves localhost and is never logged.
+  Evidence: `kimi.rs` with five parsing tests pinned against a live envelope; `codenotch.exe kimi` printed the live quota (5-hour 55 %, monthly 3 %). `usage-kimi.json` persists the reading between launches.
+- [x] Kimi glyph from `@lobehub/icons-static-svg` (MIT), built-in, overridable via `%APPDATA%\codenotch\glyphs\kimi.svg`.
+- [x] Build, test, install, verify the running widget.
+  Evidence: `cargo test --release`: 41 passed, 0 failed. `install.ps1` installed r34; `/status` reports build r34 with `kimi.status=ok` (limit5h 55 %, monthCode 3 %, monthTotal 3 %) and Codex ok; doctor lists the Kimi source (server 127.0.0.1:29565, token 43 chars) and the built-in kimi glyph.
+  Note: `cargo clean` was required once — the moved `target/` kept fingerprints pointing at the old `C:\Users\1\Desktop\codenotch` path, so stale build-script outputs referenced a directory that no longer exists.
+
+Limits: Kimi "working" state (spinning arc) is not inferred — the cell shows quota only, same class as DeepSeek. The Extra Usage balance is surfaced as a card note only when the endpoint returns a numeric balance. The user had Cursor and Antigravity switched off in the tray; with them hidden the pill shows Codex, DeepSeek, Kimi.
+
+## Windows Codex activity follow-up — 2026-10-20
+
+- [x] Ignore orphaned inProgress turns superseded by newer completed turns; read freshness from the same turn, and recompute time expiry independently of database writes.
+- [x] Re-evaluate cached rollout steps with their own timeouts, honor explicit final answers and completed desktop state, and use message timestamps rather than file mtime. A later CLI resume can supersede an earlier desktop completion.
+- [x] Run activity regressions/full suite, build/install r33, and verify only genuinely active turns remain.
+  Evidence: `cargo test --release --offline -p codenotch`: 44 passed, 0 failed/ignored, 0.01 s execution; seven new activity tests. `cargo build --release --offline -p codenotch`: success, 1m 50s. Installed r33; SHA-256 matches release build; r32 backed up in the chat's work folder.
+  Runtime `/status`: r33, Claude idle, one Codex busy entry with `since=1792494777000`, matching the current chat's live turn start; Codex limits ok. Read-only database verification found no other fresh current turns; old orphan records are excluded. Live query costs about 3 ms.
+
+Evidence: live read-only SQLite inspection showed old orphaned inProgress rows in threads with newer completed turns. The current chat is genuinely in progress during this repair.
+
+Limits: the current chat remains genuinely busy until this response finishes; its actual post-response idle transition cannot be observed from within the same active turn. Completion/expiry and same-second turn ordering are verified by tests. No Codex database records were changed. Coverage/mutation were not configured/requested. Existing unused `hooks_install::is_installed` warning remains. This slice is complete.
+
+## Windows reliability fixes — 2026-10-20
+
+- [x] Claude: ignore unchanged/old conversation entries when transcript metadata changes; honor explicit turn completion and expire abandoned inferred activity. Remove network traffic as a task-running signal.
+  Evidence: `watcher.rs`, `state.rs`, `activity.rs`; watcher/state regression tests.
+- [x] Codex: use Windows HTTP/TLS and system proxy settings, preserve the newest cached reading on failures, hide expired cached windows, and retry transient failures without restarting.
+  Evidence: `codex.rs`, `codex_http.rs`; cache/expiry/backoff tests and local WinHTTP tests.
+- [x] Add regression tests, run Windows tests/build, install and verify the actual widget.
+  Evidence: `cargo test --release --offline -p codenotch`: 37 passed, 0 failed/ignored, 0.02 s execution (17.30 s incremental test build). `cargo build --release --offline -p codenotch`: success, 1m 54s.
+  Installed r32 in `%LOCALAPPDATA%/Programs/Codenotch`; SHA-256 matches release build; previous exe backed up in the chat's `work/` folder.
+  Runtime: `/status` reports r32, Claude `done` with no running tasks, Codex `ok`, fresh 5h/weekly windows (60%/9% at installation). Usage matched the Codex account's live endpoint. An isolated hook session transitioned running → done → removed. Screenshot confirms no Claude activity arc. Subsequent status after the watcher rescan stayed completed.
+
+Verification: full test suite passed after fixing the new transport's empty-header handling and Retry-After parsing. Coverage/mutation not configured or requested; the macOS suite is not applicable to this Windows-only change. Existing unused `hooks_install::is_installed` warning remains. Existing unrelated monitor changes in `windows/codenotch/src/main.rs` are preserved. No further slice required for this fix. Long-duration real internet outages were not induced; recovery/cache/backoff behavior was checked with regression tests. Cloud tasks without local transcripts intentionally have no network-based running inference.
+
 Full detail in [`docs/plans/2026-08-28-usage-notch-plan.md`](docs/plans/2026-08-28-usage-notch-plan.md).
 Design spec in [`docs/specs/2026-08-28-usage-notch-design.md`](docs/specs/2026-08-28-usage-notch-design.md).
 

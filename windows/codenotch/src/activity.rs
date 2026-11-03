@@ -1,7 +1,7 @@
-//! "Is it working?" for the non-Claude providers (Claude's local sessions go through the hooks +
-//! transcript-watcher engine, not here).
+//! "Is it working?" for the providers (the usage rings come from the adapters; this is the
+//! working-state overlay).
 //!
-//! None of the three has a state field like Claude Code's, so each is labelled with whatever it
+//! None of the three has a state field of its own, so each is labelled with whatever it
 //! can honestly provide (the same trade-off upstream made):
 //!   - Cursor: the `composerHeaders` rows (JSON) in the editor's `state.vscdb` — `unfinishedRunAt`
 //!     is set for the duration of a run and cleared when it ends; `hasBlockingPendingActions` /
@@ -12,15 +12,12 @@
 //!     `~/.codex/thread_history_1.sqlite` (status = inProgress with an empty completed_at = running)
 //!     — real state. The CLI / VS Code extension fall back to classifying the last entry of the
 //!     rollout, with a silence threshold that depends on the entry type.
-//!   - Claude cloud sessions: no local transcript, so they are inferred from the desktop app's
-//!     network throughput (marked ~).
 //!   - Antigravity: transcript.jsonl is appended during a run (each step is written only once it
 //!     completes, so status is always DONE and useless); written within the last 45 s = working
 //!     (the model can think for a long time between steps, hence the wide window).
 //! Polled every 2 s (upstream cadence), broadcast only on change. Cost discipline: database
 //! connections stay open, nothing is re-queried unless the file's mtime changed, the rollout tail
-//! is re-read only when its mtime changed, PowerShell runs only occasionally to find the network
-//! process pid, and the thread runs at lowered priority.
+//! is re-read only when its mtime changed, and the thread runs at lowered priority.
 
 use crate::AppState;
 use serde::Serialize;
@@ -32,7 +29,7 @@ const ANTIGRAVITY_STALE_MS: u64 = 45_000;
 
 #[derive(Clone, Serialize, Debug, PartialEq)]
 pub struct Activity {
-    /// Provider id other than claude: codex / cursor / gemini / deepseek
+    /// Provider id: codex / cursor / gemini / deepseek
     pub provider: String,
     /// busy | waiting
     pub state: String,
@@ -117,7 +114,7 @@ struct Ctx {
     rollout_path: Option<std::path::PathBuf>,
     rollout_checked_at: u64,
     rollout_sig: u64,
-    rollout_last: Vec<Activity>,
+    rollout_step: Option<(CodexStep, u64)>,
 }
 
 impl Ctx {
@@ -130,7 +127,7 @@ impl Ctx {
             rollout_path: None,
             rollout_checked_at: 0,
             rollout_sig: 0,
-            rollout_last: Vec::new(),
+            rollout_step: None,
         }
     }
 }
@@ -224,6 +221,7 @@ fn codex_last_step(text: &str) -> Option<(CodexStep, u64)> {
                 "function_call" | "local_shell_call" | "custom_tool_call" | "web_search_call" => Some(CodexStep::Tool),
                 "function_call_output" | "custom_tool_call_output" | "reasoning" => Some(CodexStep::Thinking),
                 "message" => match p.get("role").and_then(|x| x.as_str()).unwrap_or("") {
+                    "assistant" if p.get("channel").and_then(|x| x.as_str()) == Some("final") => Some(CodexStep::Aborted),
                     "assistant" => Some(CodexStep::AsstMsg),
                     "user" => Some(CodexStep::Thinking),
                     _ => None, // system/developer messages say nothing about state
@@ -231,9 +229,10 @@ fn codex_last_step(text: &str) -> Option<(CodexStep, u64)> {
                 _ => None,
             },
             "event_msg" => match pt {
-                "turn_aborted" | "task_complete" => Some(CodexStep::Aborted), // newer builds do write task_complete: an explicit end
+                "turn_aborted" | "task_complete" | "task_completed" | "turn_complete" | "turn_failed" => Some(CodexStep::Aborted),
                 "task_started" | "item_started" | "exec_command_begin" => Some(CodexStep::Thinking),
                 "user_message" => Some(CodexStep::Thinking),
+                "agent_message" if p.get("phase").and_then(|x| x.as_str()) == Some("final_answer") => Some(CodexStep::Aborted),
                 "agent_message" => Some(CodexStep::AsstMsg),
                 "agent_reasoning" | "agent_reasoning_raw_content" => Some(CodexStep::Thinking),
                 _ => None, // token_count and other bookkeeping lines
@@ -258,13 +257,23 @@ fn codex_turns_in_progress(ctx: &mut Ctx) -> Vec<Activity> {
         ctx.codex_names = dirs::home_dir().and_then(|h| open_ro(&h.join(".codex").join("state_5.sqlite")));
     }
     let names = ctx.codex_names.as_ref();
-    ctx.codex_turns.refresh(|conn| {
+    // Unlike Cursor's cached UI flags, Codex freshness expires with time even if the DB is unchanged.
+    ctx.codex_turns.checked_once = false;
+    ctx.codex_turns.refresh(|conn| desktop_codex_activity(conn, names, now))
+}
+
+fn desktop_codex_activity(conn: &rusqlite::Connection, names: Option<&rusqlite::Connection>, now: u64) -> Option<Vec<Activity>> {
         let mut stmt = conn
-            .prepare("SELECT thread_id, started_at FROM thread_turns WHERE status = 'inProgress' ORDER BY started_at DESC LIMIT 8")
+            .prepare("SELECT t.thread_id, t.started_at, t.turn_id FROM thread_turns t
+                WHERE t.status = 'inProgress' AND t.completed_at IS NULL AND t.started_at > 0
+                  AND NOT EXISTS (SELECT 1 FROM thread_turns newer WHERE newer.thread_id = t.thread_id
+                    AND (newer.started_at > t.started_at OR (newer.started_at = t.started_at
+                        AND COALESCE(newer.rollout_ordinal,0) > COALESCE(t.rollout_ordinal,0))))
+                ORDER BY t.started_at DESC LIMIT 8")
             .ok()?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, rusqlite::types::Value>(1)?))).ok()?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, rusqlite::types::Value>(1)?,r.get::<_, String>(2)?))).ok()?;
         let mut out = Vec::new();
-        for (thread_id, started) in rows.flatten() {
+        for (thread_id, started, turn_id) in rows.flatten() {
             let started_ms = match started {
                 rusqlite::types::Value::Integer(i) => (i as u64) * if i > 10_000_000_000 { 1 } else { 1000 },
                 rusqlite::types::Value::Real(f) => (f * if f > 10_000_000_000.0 { 1.0 } else { 1000.0 }) as u64,
@@ -273,8 +282,8 @@ fn codex_turns_in_progress(ctx: &mut Ctx) -> Vec<Activity> {
             // The thread's latest item: freshness, and whether it is waiting for approval
             let (last_ms, last_type): (Option<i64>, Option<String>) = conn
                 .query_row(
-                    "SELECT created_at_ms, item_type FROM thread_items WHERE thread_id = ?1 ORDER BY created_at_ms DESC LIMIT 1",
-                    [&thread_id],
+                    "SELECT created_at_ms, item_type FROM thread_items WHERE thread_id = ?1 AND turn_id = ?2 ORDER BY created_at_ms DESC LIMIT 1",
+                    [&thread_id, &turn_id],
                     |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<String>>(1)?)),
                 )
                 .unwrap_or((None, None));
@@ -315,7 +324,30 @@ fn codex_turns_in_progress(ctx: &mut Ctx) -> Vec<Activity> {
             });
         }
         Some(out)
-    })
+}
+
+fn rollout_busy(step: Option<(CodexStep, u64)>, now: u64) -> bool {
+    let Some((step, at)) = step.filter(|(_, at)| *at > 0) else { return false };
+    let quiet = now.saturating_sub(at);
+    match step {
+        CodexStep::Tool => quiet <= 10 * 60_000,
+        CodexStep::Thinking => quiet <= 120_000,
+        CodexStep::AsstMsg => quiet <= 4_000,
+        CodexStep::Aborted => false,
+    }
+}
+
+fn rollout_is_completed(path: &std::path::Path, conn: Option<&rusqlite::Connection>, step: Option<(CodexStep,u64)>) -> bool {
+    let Some(conn) = conn else { return false };
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { return false };
+    let Some(id) = stem.len().checked_sub(36).and_then(|at| stem.get(at..)) else { return false };
+    conn.query_row("SELECT status, completed_at FROM thread_turns WHERE thread_id = ?1 ORDER BY started_at DESC, rollout_ordinal DESC LIMIT 1",
+        [id], |r| Ok((r.get::<_, String>(0)?,r.get::<_, Option<i64>>(1)?)))
+        .map(|(status,completed)| {
+            let completed=completed.unwrap_or(0).max(0) as u64;
+            let completed=if completed > 10_000_000_000 { completed } else { completed*1000 };
+            status != "inProgress" && step.map(|(_,at)| at <= completed).unwrap_or(false)
+        }).unwrap_or(false)
 }
 
 fn codex_activity(ctx: &mut Ctx) -> Vec<Activity> {
@@ -328,167 +360,24 @@ fn codex_activity(ctx: &mut Ctx) -> Vec<Activity> {
     let now = now_ms();
     if now.saturating_sub(ctx.rollout_checked_at) > 30_000 || ctx.rollout_path.is_none() {
         ctx.rollout_checked_at = now;
-        ctx.rollout_path = crate::codex::newest_rollout();
+        let path = crate::codex::newest_rollout();
+        if path != ctx.rollout_path {
+            ctx.rollout_sig = 0;
+            ctx.rollout_step = None;
+        }
+        ctx.rollout_path = path;
     }
     let Some(p) = ctx.rollout_path.clone() else { return vec![] };
     let mtime = mtime_ms(&p).unwrap_or(0);
-    if mtime == ctx.rollout_sig {
-        // Content unchanged: only re-evaluate whether the silence has timed out
-        return ctx
-            .rollout_last
-            .iter()
-            .filter(|a| now.saturating_sub(a.since) <= 10 * 60_000)
-            .cloned()
-            .collect();
+    if mtime != ctx.rollout_sig {
+        ctx.rollout_sig = mtime;
+        ctx.rollout_step = crate::codex::tail_text(&p).and_then(|text| codex_last_step(&text));
     }
-    ctx.rollout_sig = mtime;
-    ctx.rollout_last.clear();
-    if let Some(text) = crate::codex::tail_text(&p) {
-        if let Some((step, ts)) = codex_last_step(&text) {
-            let at = ts.max(mtime);
-            let quiet = now.saturating_sub(at);
-            let busy = match step {
-                CodexStep::Tool => quiet <= 10 * 60_000,
-                CodexStep::Thinking => quiet <= 120_000,
-                CodexStep::AsstMsg => quiet <= 4_000,
-                CodexStep::Aborted => false,
-            };
-            if busy {
-                ctx.rollout_last = vec![Activity { provider: "codex".into(), state: "busy".into(), name: "Codex".into(), detail: "Working".into(), since: at }];
-            }
-        }
-    }
-    ctx.rollout_last.clone()
-}
-
-// ---------------- Claude desktop (cloud sessions): network-activity heuristic ----------------
-
-/// Cloud sessions leave no local transcript, so the four-state engine cannot see them. Next best
-/// thing: while output is streaming, the Claude desktop app keeps receiving data from the network
-/// (Winsock goes through AFD IOCTLs, which land in the Other counter of the process I/O counters).
-/// Sampled every 2 s; a rate above the threshold means "streaming". Explicitly marked as inferred
-/// (~); the first 60 samples go to run.log so the threshold can be calibrated.
-struct IoSample {
-    at: u64,
-    other: u64,
-    read: u64,
-}
-static CLAUDE_IO: std::sync::Mutex<Option<IoSample>> = std::sync::Mutex::new(None);
-static CLAUDE_LAST_ACTIVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-const CLAUDE_RATE_BPS: f64 = 2_500.0; // socket traffic of the network service process only; the idle heartbeat is far below this, streaming far above
-const CLAUDE_HOLD_MS: u64 = 10_000; // tool calls often leave 2–4 s gaps with zero traffic; holding for 10 s avoids flicker
-static CLAUDE_HITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
-/// Pid of the Claude desktop app's (Electron) network service child: its command line contains
-/// `network.mojom.NetworkService`. All socket traffic goes through it, so the IOCTL noise of the
-/// GPU/renderer processes (driver calls count as Other too) stays out. Found once and cached;
-/// looked up again when the process disappears or every 5 minutes. The command line comes from
-/// PowerShell, so that cost is paid only on a lookup.
-static CLAUDE_NET_PID: std::sync::Mutex<(u32, u64)> = std::sync::Mutex::new((0, 0));
-
-#[cfg(windows)]
-fn claude_net_pid(maps: &crate::focus::ProcMaps) -> Option<u32> {
-    let now = now_ms();
-    {
-        let g = CLAUDE_NET_PID.lock().unwrap();
-        let (pid, at) = *g;
-        if pid != 0 && maps.name.get(&pid).map(|n| n == "claude.exe").unwrap_or(false) && now.saturating_sub(at) < 5 * 60_000 {
-            return Some(pid);
-        }
-        // Cache a miss for 60 s too: otherwise a PowerShell run every 2 s (a few hundred ms of CPU each) becomes the next source of lag
-        if pid == 0 && at != 0 && now.saturating_sub(at) < 60_000 {
-            return None;
-        }
-        // Claude desktop is not running at all: no need for PowerShell
-        if !maps.name.values().any(|n| n == "claude.exe") {
-            return None;
-        }
-    }
-    let mut cmd = std::process::Command::new("powershell");
-    cmd.args([
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        "Get-CimInstance Win32_Process -Filter \"Name='claude.exe'\" | Where-Object { $_.CommandLine -like '*network.mojom.NetworkService*' } | Select-Object -First 1 -ExpandProperty ProcessId",
-    ]);
-    cmd.stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-    use std::os::windows::process::CommandExt;
-    cmd.creation_flags(0x0800_0000);
-    let pid: u32 = match cmd.output().ok().and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok()) {
-        Some(p) => p,
-        None => {
-            *CLAUDE_NET_PID.lock().unwrap() = (0, now);
-            return None;
-        }
-    };
-    *CLAUDE_NET_PID.lock().unwrap() = (pid, now);
-    crate::applog(&format!("claude net pid = {pid}"));
-    Some(pid)
-}
-
-#[cfg(windows)]
-fn claude_io_bytes() -> Option<(u64, u64)> {
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{GetProcessIoCounters, OpenProcess, IO_COUNTERS, PROCESS_QUERY_LIMITED_INFORMATION};
-    let maps = crate::focus::proc_maps();
-    let net_pid = claude_net_pid(&maps)?;
-    let mut other = 0u64;
-    let mut read = 0u64;
-    let mut n = 0;
-    for (pid, _name) in maps.name.iter() {
-        if *pid != net_pid {
-            continue;
-        }
-        unsafe {
-            let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, *pid) else { continue };
-            let mut io = IO_COUNTERS::default();
-            if GetProcessIoCounters(h, &mut io).is_ok() {
-                other = other.saturating_add(io.OtherTransferCount);
-                read = read.saturating_add(io.ReadTransferCount);
-                n += 1;
-            }
-            let _ = CloseHandle(h);
-        }
-    }
-    if n == 0 {
-        None
-    } else {
-        Some((other, read))
-    }
-}
-#[cfg(not(windows))]
-fn claude_io_bytes() -> Option<(u64, u64)> {
-    None
-}
-
-fn claude_activity() -> Vec<Activity> {
-    let now = now_ms();
-    let Some((other, read)) = claude_io_bytes() else { return vec![] };
-    let mut guard = CLAUDE_IO.lock().unwrap();
-    let (rate_other, rate_read) = match guard.as_ref() {
-        Some(prev) if now > prev.at && other >= prev.other && read >= prev.read => {
-            let dt = (now - prev.at) as f64 / 1000.0;
-            ((other - prev.other) as f64 / dt, (read - prev.read) as f64 / dt)
-        }
-        _ => (0.0, 0.0),
-    };
-    *guard = Some(IoSample { at: now, other, read });
-    drop(guard);
-    static SAMPLES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    if SAMPLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 240 {
-        crate::applog(&format!("claude io: net {:.0} B/s, disk {:.0} B/s", rate_other, rate_read));
-    }
-    // Two consecutive samples (≈4 s) above the threshold; a single spike (heartbeat, sync) does not count
-    if rate_other >= CLAUDE_RATE_BPS {
-        if CLAUDE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 1 {
-            CLAUDE_LAST_ACTIVE.store(now, std::sync::atomic::Ordering::Relaxed);
-        }
-    } else {
-        CLAUDE_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
-    }
-    let last = CLAUDE_LAST_ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
-    if last > 0 && now.saturating_sub(last) <= CLAUDE_HOLD_MS {
-        vec![Activity { provider: "claude".into(), state: "busy".into(), name: "Claude".into(), detail: "Streaming (network)".into(), since: last }]
+    // Completed desktop state wins over older transcript entries, but permits a later CLI resume.
+    if rollout_is_completed(&p, ctx.codex_turns.conn.as_ref(), ctx.rollout_step) { return vec![]; }
+    if rollout_busy(ctx.rollout_step, now) {
+        vec![Activity { provider: "codex".into(), state: "busy".into(), name: "Codex".into(),
+            detail: "Working".into(), since: ctx.rollout_step.unwrap().1 }]
     } else {
         vec![]
     }
@@ -606,7 +495,6 @@ fn presence() -> Presence {
 
 fn read_all(p: Presence, ctx: &mut Ctx) -> Vec<Activity> {
     let mut all = Vec::new();
-    all.extend(claude_activity());
     if p.cursor {
         all.extend(cursor_activity(ctx));
     }
@@ -697,4 +585,80 @@ pub fn start(app: AppHandle) {
             std::thread::sleep(INTERVAL);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn database() -> rusqlite::Connection {
+        let c=rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE thread_turns(thread_id TEXT,turn_id TEXT,status TEXT,started_at INTEGER,completed_at INTEGER,rollout_ordinal INTEGER);
+            CREATE TABLE thread_items(thread_id TEXT,turn_id TEXT,created_at_ms INTEGER,item_type TEXT);").unwrap();
+        c
+    }
+
+    #[test]
+    fn completed_new_turn_prevents_old_orphan_from_becoming_active() {
+        let c=database();
+        c.execute_batch("INSERT INTO thread_turns VALUES('chat','orphan','inProgress',100,NULL,1);
+            INSERT INTO thread_turns VALUES('chat','new','completed',200,201,2);
+            INSERT INTO thread_items VALUES('chat','new',201000,'agentMessage');").unwrap();
+        assert!(desktop_codex_activity(&c,None,202000).unwrap().is_empty());
+    }
+
+    #[test]
+    fn turns_in_the_same_second_use_rollout_order() {
+        let c=database();
+        c.execute_batch("INSERT INTO thread_turns VALUES('chat','orphan','inProgress',200,NULL,1);
+            INSERT INTO thread_turns VALUES('chat','new','completed',200,201,2);").unwrap();
+        assert!(desktop_codex_activity(&c,None,202000).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unrelated_turn_items_cannot_keep_an_orphan_fresh() {
+        let c=database();
+        c.execute_batch("INSERT INTO thread_turns VALUES('chat','orphan','inProgress',100,NULL,1);
+            INSERT INTO thread_items VALUES('chat','orphan',100000,'agentMessage');
+            INSERT INTO thread_items VALUES('chat','different',1000000,'agentMessage');").unwrap();
+        assert!(desktop_codex_activity(&c,None,1000000).unwrap().is_empty());
+    }
+
+    #[test]
+    fn activity_expires_without_database_writes() {
+        let c=database();
+        c.execute_batch("INSERT INTO thread_turns VALUES('chat','active','inProgress',100,NULL,1);
+            INSERT INTO thread_items VALUES('chat','active',110000,'agentMessage');").unwrap();
+        assert_eq!(desktop_codex_activity(&c,None,111000).unwrap().len(),1);
+        assert!(desktop_codex_activity(&c,None,800000).unwrap().is_empty());
+    }
+
+    #[test]
+    fn cached_rollout_keeps_the_step_specific_timeout() {
+        let at=1_800_000_000_000;
+        assert!(rollout_busy(Some((CodexStep::Thinking,at)),at+119000));
+        assert!(!rollout_busy(Some((CodexStep::Thinking,at)),at+121000));
+        assert!(rollout_busy(Some((CodexStep::AsstMsg,at)),at+3000));
+        assert!(!rollout_busy(Some((CodexStep::AsstMsg,at)),at+5000));
+        assert!(!rollout_busy(Some((CodexStep::Aborted,at)),at));
+    }
+
+    #[test]
+    fn final_answer_is_idle_without_task_complete_event() {
+        let raw=json!({"timestamp":"2026-10-20T10:00:00Z","type":"response_item",
+            "payload":{"type":"message","role":"assistant","channel":"final","content":[]}}).to_string();
+        let step=codex_last_step(&raw);
+        assert_eq!(step.unwrap().0,CodexStep::Aborted);
+        assert!(!rollout_busy(step,1_800_000_000_000));
+    }
+
+    #[test]
+    fn completed_desktop_state_overrides_recent_transcript() {
+        let c=database();
+        c.execute_batch("INSERT INTO thread_turns VALUES('01a1552d-d1ca-7073-8ac9-4a8a4ee6292d','turn','completed',200,201,1);").unwrap();
+        let path=std::path::Path::new("rollout-2026-10-20T13-00-00-01a1552d-d1ca-7073-8ac9-4a8a4ee6292d.jsonl");
+        assert!(rollout_is_completed(path,Some(&c),Some((CodexStep::Tool,200000))));
+        assert!(!rollout_is_completed(path,Some(&c),Some((CodexStep::Thinking,202000))));
+    }
 }

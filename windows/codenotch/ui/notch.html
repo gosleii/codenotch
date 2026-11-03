@@ -128,7 +128,7 @@ const AMPLE='#00FF88', WATCH='#F2FF00', CRIT='#FF3F00';
 const TRACK='#303030', AMBER='#FFBF00', RUNGREEN='#28E07B';
 const tone=f=> f>=0.8?CRIT : f>=0.5?WATCH : AMPLE;
 
-let usage={status:'',windows:[],fetched_at:0,note:''};
+let kimiSnap={status:'absent',windows:[],fetched_at:0,note:''};
 let codexSnap={status:'absent',windows:[],fetched_at:0,note:''};
 let cursorSnap={status:'absent',windows:[],fetched_at:0,note:''};
 let agSnap={status:'absent',windows:[],fetched_at:0,note:''};
@@ -136,16 +136,9 @@ let dsSnap={status:'absent',windows:[],fetched_at:0,note:''};
 let layout={edge:'right',monitor:'',primary:true}; // which edge Rust pinned the notch to; the page mirrors itself
 let hidden=[]; // provider ids switched off in the tray: no cell, and Rust stops polling them too
 let glyphs={}; // id → {kind:'mark'|'appicon', url}
-let activity=[]; // working state of the non-Claude providers: {provider,state:'busy'|'waiting',name,detail,since}
-// "Is it working?" per provider: Claude from the four-state engine, the others from the activity probe. Returns running | attention | idle
+let activity=[]; // working state of the providers: {provider,state:'busy'|'waiting',name,detail,since}
+// "Is it working?" per provider, from the activity probe. Returns running | attention | idle
 function workState(id){
-  if(id==='claude'){
-    if(stateSnap.agg==='running') return 'running';
-    if(stateSnap.agg==='attention') return 'attention';
-    // The engine cannot see cloud sessions: fall back to the desktop app's network activity
-    if(activity.some(a=>a.provider==='claude'&&a.state==='busy')) return 'running';
-    return 'idle';
-  }
   const acts=activity.filter(a=>a.provider===id);
   if(acts.some(a=>a.state==='waiting')) return 'attention';
   if(acts.some(a=>a.state==='busy')) return 'running';
@@ -159,7 +152,9 @@ function glyphHtml(p,small){
 }
 // Provider table (order = top to bottom in the pill). `glyph` is the fallback letter used when no mark is available
 function providers(){
-  const list=[{id:'claude',name:'Claude',glyph:'C',snap:usage}];
+  const list=[];
+  // Kimi Code's cell stays hidden until its local server is running (status 'absent')
+  if(kimiSnap.status!=='absent') list.push({id:'kimi',name:'Kimi',glyph:'K',snap:kimiSnap});
   if(codexSnap.status!=='absent') list.push({id:'codex',name:'Codex',glyph:'Cx',snap:codexSnap});
   if(cursorSnap.status!=='absent') list.push({id:'cursor',name:'Cursor',glyph:'Cu',snap:cursorSnap});
   if(agSnap.status!=='absent') list.push({id:'gemini',name:'Antigravity',glyph:'Ag',snap:agSnap});
@@ -175,23 +170,12 @@ function headlineOf(snap){
   return snap.windows[0];
 }
 function staleOf(snap){ if(snap.status==='stale') return true; return snap.fetched_at>0 && (Date.now()-snap.fetched_at)>5*60*1000; }
-let stateSnap={sessions:[],agg:'idle'};
 
 function svgArc(r,frac,color,width,extra=''){
   const C=2*Math.PI*r;
   return `<circle cx="28" cy="28" r="${r}" fill="none" stroke="${color}" stroke-width="${width}"
     stroke-dasharray="${(C*frac).toFixed(2)} ${C.toFixed(2)}" stroke-linecap="butt"
     transform="rotate(-90 28 28)" ${extra}/>`;
-}
-
-function headline(){ // the cell shows the most constrained window — the one that will stop you first
-  if(!usage.windows.length) return null;
-  return usage.windows.reduce((a,b)=> b.used>a.used?b:a);
-}
-
-function isStale(){
-  if(usage.status==='stale') return true;
-  return usage.fetched_at>0 && (Date.now()-usage.fetched_at)>5*60*1000;
 }
 
 function renderRing(){
@@ -244,9 +228,7 @@ function ago(ms){
   return m<60?`${m}m ago`:`${Math.round(m/60)}h ago`;
 }
 
-const STATE_DOT={running:RUNGREEN,attention:AMBER,done:'#57c7ff'};
-
-let hoverId='claude';
+let hoverId='';
 function renderCard(){
   const c=document.getElementById('card');
   if(!providers().length){ c.innerHTML=''; c.classList.remove('show'); return; } // every provider switched off
@@ -256,7 +238,7 @@ function renderCard(){
   let html=`<div class="c-head">${headIcon}<span class="c-title">${p.name} Usage</span></div>`;
   if(staleOf(snap)&&snap.fetched_at) html+=`<div class="c-sub">Updated ${ago(snap.fetched_at)}</div>`;
   if(snap.status==='needsAuth'){
-    const who={claude:'Sign in to Claude Code to see usage.',cursor:'Sign in to Cursor to see usage.',codex:'Sign in to Codex to see usage.',gemini:'Sign in to Antigravity to see usage.',deepseek:'Add a DeepSeek API key to see the balance.'}[p.id]||'';
+    const who={cursor:'Sign in to Cursor to see usage.',codex:'Sign in to Codex to see usage.',gemini:'Sign in to Antigravity to see usage.',deepseek:'Add a DeepSeek API key to see the balance.',kimi:'Sign in to Kimi Code to see usage.'}[p.id]||'';
     html+=`<div class="c-note">${who}<br>${snap.note||''}</div>`;
   }else if(!snap.windows.length){
     html+=`<div class="c-note">${snap.note||'Waiting for first reading…'}</div>`;
@@ -280,16 +262,8 @@ function renderCard(){
     }
     if(snap.note) html+=`<div class="c-note">${snap.note}</div>`;
   }
-  if(p.id==='claude'){ // live sessions (a full list with jump-to-session is a follow-up)
-    const act=stateSnap.sessions.filter(s=>s.state!=='idle');
-    if(act.length){
-      html+=`<div class="c-sessions">`;
-      for(const s of act.slice(0,5)){
-        html+=`<div class="s-row"><span class="s-dot" style="background:${STATE_DOT[s.state]||'#666'}"></span>${esc(s.title)}</div>`;
-      }
-      html+=`</div>`;
-    }
-  }else{ // other providers: detected activity rows (Cursor reports state; Codex/Antigravity are inferred from recent writes)
+  // detected activity rows (Cursor reports state; Codex/Antigravity are inferred from recent writes)
+  {
     const acts=activity.filter(a=>a.provider===p.id);
     if(acts.length){
       html+=`<div class="c-sessions">`;
@@ -389,8 +363,7 @@ document.addEventListener('mouseout',e=>{ // relatedTarget null = the cursor lef
 });
 listen('pointer_left',()=>{clearTimeout(hideTimer);hideCard();}).catch(()=>{});
 // Card content changes change its height -> report the hot rectangles again
-listen('usage',()=>{if(card.classList.contains('show'))armWatchdog();}).catch(()=>{});
-listen('state',()=>{if(card.classList.contains('show'))armWatchdog();}).catch(()=>{});
+listen('kimi',()=>{if(card.classList.contains('show'))armWatchdog();}).catch(()=>{});
 /* The pill can be dragged up and down the right edge. Press and move more than 4 px = drag (handed to Rust,
    which follows the system cursor; the card is collapsed first); release without moving = click (opens the provider's usage page). */
 let press=null, dragging=false;
@@ -415,11 +388,9 @@ function notice(msg){
   clearTimeout(n._h);n._h=setTimeout(()=>n.classList.remove('show'),6000);
 }
 
-listen('usage',e=>{usage=e.payload||usage;renderRing();if(card.classList.contains('show'))renderCard();})
-  .catch(e=>notice('listen(usage) failed: '+e));
-listen('state',e=>{stateSnap=e.payload||stateSnap;renderRing();if(card.classList.contains('show'))renderCard();})
-  .catch(e=>notice('listen(state) failed: '+e));
 listen('notice',e=>notice(e.payload)).catch(()=>{});
+listen('kimi',e=>{kimiSnap=e.payload||kimiSnap;renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
+invoke('get_kimi').then(u=>{kimiSnap=u||kimiSnap;renderRing();}).catch(()=>{});
 listen('codex',e=>{codexSnap=e.payload||codexSnap;renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
 listen('cursor',e=>{cursorSnap=e.payload||cursorSnap;renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
 invoke('get_cursor').then(u=>{cursorSnap=u||cursorSnap;renderRing();}).catch(()=>{});
@@ -440,8 +411,6 @@ invoke('get_layout').then(l=>{layout=l||layout;applyLayout();}).catch(()=>{});
 function applyProviders(){hoverId=providers().some(p=>p.id===hoverId)?hoverId:(providers()[0]||{}).id||'';renderRing();if(card.classList.contains('show'))renderCard();}
 listen('providers',e=>{hidden=e.payload||hidden;applyProviders();}).catch(()=>{});
 invoke('get_hidden').then(h=>{hidden=h||hidden;applyProviders();}).catch(()=>{});
-invoke('get_usage').then(u=>{usage=u||usage;renderRing();}).catch(e=>notice('get_usage failed: '+e));
-invoke('get_state').then(s=>{stateSnap=s||stateSnap;renderRing();}).catch(()=>{});
 setInterval(renderRing,30_000); // stale state and reset copy move with time
 </script>
 </body>
